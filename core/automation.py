@@ -3310,19 +3310,27 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 1,
             return False
 
     def still_generating() -> bool:
+        # The tool's own busy selector AND the generic "Stop" button, not one
+        # or the other: ChatGPT's composer changes its stop button's markup
+        # without notice, and a selector that silently matches nothing read as
+        # "finished" while it was still working through its tool calls (the
+        # 2026-10-05 run moved on to Claude after 5s).
         if busy_sel:
             try:
-                return any(el.is_displayed() for el in driver.find_elements(By.CSS_SELECTOR, busy_sel))
+                if any(el.is_displayed() for el in
+                       driver.find_elements(By.CSS_SELECTOR, busy_sel)):
+                    return True
             except Exception:
-                return False
+                pass
         try:
             return bool(driver.execute_script("""
                 return [...document.querySelectorAll('button')].some(button => {
                     if (!button.getClientRects().length) return false;
                     const labels = [button.innerText, button.getAttribute('aria-label'),
-                                    button.getAttribute('title')];
+                                    button.getAttribute('title'),
+                                    button.getAttribute('data-testid')];
                     return labels.some(label =>
-                        /^(stop|stop generating|stop response|cancel response)$/i
+                        /^(stop|stop generating|stop response|stop streaming|cancel response|stop-button)$/i
                             .test((label || '').trim()));
                 });
             """))
