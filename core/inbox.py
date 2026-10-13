@@ -347,6 +347,10 @@ class Attachment:
     name: str
     mime: str
     data: bytes = b""
+    # Sent as part of the message body (Content-Disposition: inline), as a
+    # signature logo is. Kept and saved like any other part, but never
+    # counted as evidence of anything (see triage.real_attachments).
+    inline: bool = False
 
     @property
     def size(self) -> int:
@@ -499,7 +503,9 @@ def parse_message(raw: bytes, uid: int = 0) -> Message:
             data = part.get_payload(decode=True) or b""
             out.attachments.append(
                 Attachment(name=os.path.basename(filename),
-                           mime=part.get_content_type(), data=data))
+                           mime=part.get_content_type(), data=data,
+                           inline=("inline" in disposition
+                                   and "attachment" not in disposition)))
             continue
         if part.get_content_type() == "text/plain":
             plain.append(_part_text(part))

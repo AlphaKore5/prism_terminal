@@ -59,6 +59,40 @@ COLUMNS = [
     "Thread",
 ]
 
+# The pipeline's own columns (2026-10-13). Appended, never inserted: a
+# register written before them still opens exactly as it was, and a row
+# saved back only gains these, empty. _write() puts them after any column
+# the owner added by hand, so nothing they set up moves either.
+#
+#   Revision       0/blank for the first quotation, 1 for "Rev 1" ... The
+#                  quotation number never changes; see revise_quotation().
+#   Price history  every EARLIER total of this quotation, oldest first, as
+#                  plain two-decimal numbers joined by "; " — "125000.00;
+#                  118000.00". The current total stays in Quotation value.
+#   Their ask      the price they countered with, plain digits, or blank.
+#   Turn           "you" or "them" — who owes the next message. Blank reads
+#                  as "you" on a new inquiry.
+#   No quotation   "yes" when a PO came in with no quotation behind it;
+#                  "maybe" when a mail only looked like one (flag_maybe_po).
+#   Proforma       "to send", "sent", then "paid" — only used when the
+#                  client switched the proforma step on.
+REVISION = "Revision"
+PRICE_HISTORY = "Price history"
+THEIR_ASK = "Their ask"
+TURN = "Turn"
+NO_QUOTATION = "No quotation"
+PROFORMA = "Proforma"
+PIPELINE_COLUMNS = [REVISION, PRICE_HISTORY, THEIR_ASK, TURN, NO_QUOTATION,
+                    PROFORMA]
+_BASE_COLUMNS = list(COLUMNS)
+COLUMNS = _BASE_COLUMNS + PIPELINE_COLUMNS
+
+TURN_YOU, TURN_THEM = "you", "them"
+YES = "yes"
+MAYBE = "maybe"       # No quotation: the mail check thinks it may be a PO
+PROFORMA_SENT, PROFORMA_PAID = "sent", "paid"
+PROFORMA_DUE = "to send"     # PO accepted, proforma not sent yet (review R11)
+
 FILENAME = "inquiries.csv"
 
 
@@ -89,7 +123,10 @@ def fy_label(when: date | datetime | None = None) -> str:
     return f"{start % 100:02d}-{(start + 1) % 100:02d}"
 
 
-_NUMBER = re.compile(r"^([A-Z]+)/(\d{2}-\d{2})/(\d+)$", re.I)
+# A trailing revision ("QTN/26-27/0101 Rev 1", "...-R1") is the same number:
+# a revised quotation keeps its number, so it must never read as a new one.
+_NUMBER = re.compile(r"^([A-Z]+)/(\d{2}-\d{2})/(\d+)"
+                     r"(?:\s*[-/ ]\s*R(?:ev)?\.?\s*\d+)?$", re.I)
 
 # The same number as it appears on disk and in a mail: the folder spelling
 # INQ-26-27-0005, a file QTN-26-27-0001.csv, a subject "Quotation
@@ -284,11 +321,14 @@ def _write(rows: list[dict], path: str) -> None:
     os.makedirs(folder, exist_ok=True)
 
     extra = [k for row in rows for k in row if k not in COLUMNS]
-    seen, columns = set(), list(COLUMNS)
+    seen, columns = set(), list(_BASE_COLUMNS)
     for key in extra:
         if key not in seen:
             seen.add(key)
             columns.append(key)
+    # After the owner's own columns, so an old register's hand-added
+    # "Salesman" column stays where they put it — see PIPELINE_COLUMNS.
+    columns += PIPELINE_COLUMNS
 
     tmp = f"{path}.tmp"
     try:
@@ -795,7 +835,7 @@ REPLY_STATUS = {
 
 
 def mark_reply(row: dict, intent: str, when: date | None = None,
-               note: str = "") -> dict:
+               note: str = "", ask=None) -> dict:
     """Move a row on because the customer answered.
 
     An intent Prism could not read leaves the status exactly as it was and
@@ -815,6 +855,10 @@ def mark_reply(row: dict, intent: str, when: date | None = None,
         # Reuse mark_lost so Result and Reason are filled the same way they are
         # when the owner closes a row by hand — one shape of "lost" in the file.
         return mark_lost(row, "Declined by customer", when)
+    if status == NEGOTIATING:
+        # They answered, so the next move is ours — and a price they named
+        # is kept for the card (see note_counter).
+        return note_counter(row, ask, when)
     row["Status"] = status
     return row
 
@@ -829,6 +873,476 @@ def note_reminder(row: dict, when: date | None = None) -> dict:
     row["Status"] = FOLLOWING_UP
     row["Last contact"] = when.strftime("%d-%m-%Y")
     return row
+
+
+# ── the pipeline: stages, revisions, counter-offers, orders ─────────────────
+# Stage MEANINGS are fixed and are worked out here from the status the file
+# already holds plus the pipeline columns — no new statuses, so a register
+# from before the pipeline reads the same. The words on screen and which
+# optional steps a client uses are the client's (inquiry_config.pipeline_of)
+# and never live in this module.
+
+STAGE_INQUIRY, STAGE_QUOTED, STAGE_NEGO = "inquiry", "quoted", "nego"
+STAGE_PO, STAGE_WON, STAGE_LOST = "po", "won", "lost"
+STAGES = (STAGE_INQUIRY, STAGE_QUOTED, STAGE_NEGO, STAGE_PO, STAGE_WON,
+          STAGE_LOST)
+
+# Optional steps, as a client switches them. Missing means this default —
+# which is today's behaviour. inquiry_config.PIPELINE_DEFAULTS["steps"]
+# carries the same values (a test holds the two together).
+STEP_DEFAULTS = {"negotiation": True, "details": True,
+                 "acknowledgement": True, "proforma": False}
+
+
+def step_on(pipeline: dict | None, step: str) -> bool:
+    """Whether an optional step is switched on in `pipeline` (the dict at
+    cfg["inquiry"]["pipeline"], or None). Anything unreadable is the
+    default."""
+    steps = (pipeline or {}).get("steps") if isinstance(pipeline, dict) else None
+    value = steps.get(step) if isinstance(steps, dict) else None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower() not in ("0", "false", "no", "off")
+    return STEP_DEFAULTS.get(step, False)
+
+
+def _flag(row: dict, column: str) -> bool:
+    return (row.get(column) or "").strip().lower() in (YES, "y", "true", "1")
+
+
+# Hand-typed statuses (the Client-file / Excel workflow): Prism's own words
+# in any case and spacing, and a few common words for the same thing. One
+# reader for the board (stage_of) and the colours (documents.status_key),
+# so the two views can never disagree about a row (review R8).
+STATUS_ALIASES = {
+    "won": CONVERTED, "order": CONVERTED, "order received": CONVERTED,
+    "lost": NOT_CONVERTED, "not converted": NOT_CONVERTED,
+    "follow up": FOLLOWING_UP, "followup": FOLLOWING_UP,
+    "following-up": FOLLOWING_UP, "negotiation": NEGOTIATING,
+    "quote sent": QUOTED, "quotation sent": QUOTED,
+}
+
+
+def normalise_status(text) -> str:
+    """The register status a cell means: Prism's spelling for any case or
+    spacing of its own words or an alias, "New" for blank, and anything
+    else returned as typed (collapsed whitespace)."""
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return NEW
+    folded = raw.casefold()
+    for status in STATUSES:
+        if folded == status.casefold():
+            return status
+    return STATUS_ALIASES.get(folded, raw)
+
+
+def stage_of(row: dict, pipeline: dict | None = None) -> tuple[str, str]:
+    """(stage, sub) for one row — where its card sits on the board.
+
+      inquiry   "you" (yours to answer) · "them" (you asked for details)
+      quoted    "" · "countered" (they countered, negotiation switched off)
+      nego      ""
+      po        "check" (a PO number to check) · "nopo" (a PO with no
+                quotation — price it) · "yes" (they said yes, PO awaited)
+                · "proforma" (proforma sent, advance awaited)
+      won, lost ""
+
+    Optional steps switched off fold the way the approved design does: a
+    negotiating row reads as quoted/countered, "asked for details" as
+    yours to answer, and a proforma left from when the step was on as won.
+    A blank or unknown status is an inquiry, or quoted if it has a
+    quotation number — a hand-kept row is shown, never dropped. Pure.
+    """
+    status = normalise_status(row.get("Status"))
+    quoted = bool((row.get("Quotation no") or "").strip())
+    if status in (QUOTED, FOLLOWING_UP):
+        return STAGE_QUOTED, ""
+    if status == NEGOTIATING:
+        if not step_on(pipeline, "negotiation"):
+            return STAGE_QUOTED, "countered"
+        return STAGE_NEGO, ""
+    if status == ACCEPTED:
+        if _flag(row, NO_QUOTATION) and not quoted:
+            return STAGE_PO, "nopo"
+        proforma = (row.get(PROFORMA) or "").strip().lower()
+        if proforma == PROFORMA_SENT:
+            if not step_on(pipeline, "proforma"):
+                return STAGE_WON, ""
+            return STAGE_PO, "proforma"
+        if proforma == PROFORMA_DUE and step_on(pipeline, "proforma"):
+            # Accepted, the proforma not sent yet: still ours to send.
+            return STAGE_PO, "proforma"
+        if (row.get("PO number") or "").strip():
+            return STAGE_PO, "check"
+        return STAGE_PO, "yes"
+    if status == CONVERTED:
+        return STAGE_WON, ""
+    if status == NOT_CONVERTED:
+        return STAGE_LOST, ""
+    if status != NEW and quoted:
+        return STAGE_QUOTED, ""
+    turn = (row.get(TURN) or "").strip().lower()
+    if turn == TURN_THEM and step_on(pipeline, "details"):
+        return STAGE_INQUIRY, "them"
+    return STAGE_INQUIRY, "you"
+
+
+def revision_of(row: dict) -> int:
+    """0 for the first quotation, n for "Rev n". The first whole number in
+    the cell, so a hand-edited "Rev 1", "R2" or Excel's "2.0" still reads as
+    1 and 2 (review R6) — reading them as 0 made the next revision reuse a
+    file name the customer already holds. Unreadable is 0."""
+    m = re.search(r"\d+", str(row.get(REVISION) or ""))
+    return int(m.group(0)) if m else 0
+
+
+def revision_on_disk(folder: str, quote_no: str) -> int:
+    """The highest -Rn file of this quotation in `folder` (0 when none)."""
+    base = quote_file_name(quote_no, 0, "")
+    if not folder or not base or not os.path.isdir(folder):
+        return 0
+    tail = re.compile(re.escape(base) + r"-R(\d+)\.[A-Za-z0-9]+$", re.I)
+    best = 0
+    try:
+        for name in os.listdir(folder):
+            m = tail.match(name)
+            if m:
+                best = max(best, int(m.group(1)))
+    except OSError:
+        return best
+    return best
+
+
+def next_revision(row: dict) -> int:
+    """The revision number to send next: one above both the register's
+    Revision and every -Rn file already in the folder, so a revision the
+    customer holds is never overwritten."""
+    folder = row.get("Folder") or ""
+    number = row.get("Quotation no") or ""
+    n = max(revision_of(row), revision_on_disk(folder, number)) + 1
+    while folder and any(
+            os.path.exists(os.path.join(folder, quote_file_name(number, n, ext)))
+            for ext in ("pdf", "csv")):
+        n += 1
+    return n
+
+
+# One amount in a price-history cell: plain digits, or Indian/Western
+# grouping ("1,25,000", "125,000"), with optional decimals and currency.
+_HISTORY_AMOUNT = re.compile(
+    r"^\s*(?:₹|rs\.?|inr)?\s*(?:\d{1,3}(?:,\d{3})+|\d{1,2}(?:,\d{2})*,\d{3}|\d+)"
+    r"(?:\.\d+)?\s*(?:/-)?\s*$", re.I)
+
+
+def _history_parts(cell: str) -> list[str]:
+    parts = []
+    for chunk in re.split(r"[;|\n]", cell or ""):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if _HISTORY_AMOUNT.match(chunk):
+            parts.append(chunk)
+        else:
+            # "125000, 118000" typed by hand: a comma list of amounts.
+            parts.extend(p.strip() for p in chunk.split(",") if p.strip())
+    return parts
+
+
+def price_history(row: dict) -> list[Decimal]:
+    """Every earlier total of this quotation, oldest first. See the
+    PIPELINE_COLUMNS note for the format; "; " is ours, but a hand-typed
+    "125000, 118000" reads too (review R13). An unreadable, zero or
+    negative entry is skipped, never turned into a price."""
+    out = []
+    for part in _history_parts(row.get(PRICE_HISTORY) or ""):
+        if not _HISTORY_AMOUNT.match(part):
+            continue
+        value = money(part)
+        if value > 0:
+            out.append(value)
+    return out
+
+
+def quote_label(row: dict) -> str:
+    """"QTN/26-27/0101 Rev 1" — the number as the customer sees it."""
+    number = (row.get("Quotation no") or "").strip()
+    revision = revision_of(row)
+    return f"{number} Rev {revision}" if number and revision else number
+
+
+def quote_file_name(quote_no: str, revision: int = 0, ext: str = "pdf") -> str:
+    """QTN-26-27-0101.pdf, and QTN-26-27-0101-R1.pdf for Rev 1. The same
+    number with an -Rn tail, which numbers_in_use() and next_number() read
+    as that same number, never as a new one."""
+    name = (quote_no or "").strip().replace("/", "-").replace("\\", "-")
+    if revision and revision > 0:
+        name = f"{name}-R{int(revision)}"
+    ext = (ext or "").lstrip(".")
+    return f"{name}.{ext}" if ext else name
+
+
+def revise_quotation(row: dict, new_value, when: date | None = None,
+                     revision: int | None = None) -> dict:
+    """Record a revised quotation: same number, Revision + 1, the old total
+    appended to Price history, back to Quoted with their ask cleared and
+    the reminders starting again. Sends nothing — the caller sends the
+    revised PDF (quote_file_name(no, revision_of(row))) and calls this
+    once it has gone.
+
+    A row with no quotation number has nothing to revise; that is a
+    ValueError rather than a quietly invented "Rev 1" of nothing.
+    """
+    if not (row.get("Quotation no") or "").strip():
+        raise ValueError("This inquiry has no quotation to revise.")
+    when = when or date.today()
+    cell = (row.get(PRICE_HISTORY) or "").strip()
+    history = price_history(row)
+    old = (row.get("Quotation value") or "").strip()
+    added = f"{money(old):.2f}" if old and money(old) > 0 else ""
+    if len(history) < len(_history_parts(cell)):
+        # Something in the cell could not be read: never shrink what the
+        # owner typed — keep it as it is and append (review R13).
+        row[PRICE_HISTORY] = "; ".join(x for x in (cell, added) if x)
+    else:
+        row[PRICE_HISTORY] = "; ".join(
+            [f"{v:.2f}" for v in history] + ([added] if added else []))
+    row[REVISION] = str(revision if revision and revision > 0
+                        else revision_of(row) + 1)
+    row["Quotation value"] = money_str(new_value)
+    row["Status"] = QUOTED
+    row[THEIR_ASK] = ""
+    row[TURN] = TURN_THEM
+    row["Reminders sent"] = "0"
+    row["Last contact"] = when.strftime("%d-%m-%Y")
+    return row
+
+
+def note_counter(row: dict, ask=None, when: date | None = None) -> dict:
+    """They countered: Negotiating, your turn, and their price when it is
+    known. An ask of None leaves an earlier one in place rather than
+    erasing what was read off a previous mail."""
+    when = when or date.today()
+    row["Status"] = NEGOTIATING
+    row[TURN] = TURN_YOU
+    if ask is not None and money(ask) > 0:
+        row[THEIR_ASK] = money_str(ask)
+    row["Last contact"] = when.strftime("%d-%m-%Y")
+    return row
+
+
+def hold_price(row: dict, when: date | None = None) -> dict:
+    """You held the price — the next move is theirs. Status unchanged."""
+    when = when or date.today()
+    row[TURN] = TURN_THEM
+    row["Last contact"] = when.strftime("%d-%m-%Y")
+    return row
+
+
+def mark_asked_details(row: dict, when: date | None = None) -> dict:
+    """You asked for details before quoting: still an inquiry, their turn."""
+    when = when or date.today()
+    row[TURN] = TURN_THEM
+    row["Last contact"] = when.strftime("%d-%m-%Y")
+    return row
+
+
+def mark_po_without_quote(row: dict, po_number: str = "",
+                          when: date | None = None) -> dict:
+    """A PO arrived with no quotation behind it: Accepted, flagged, so the
+    board shows it as "price it from the rate list" instead of as a new
+    inquiry waiting for a quotation nobody will send. A PO number, when
+    one was read, is kept; an empty one never erases a typed one."""
+    when = when or date.today()
+    row["Status"] = ACCEPTED
+    row[NO_QUOTATION] = YES
+    if (po_number or "").strip():
+        row["PO number"] = po_number.strip()
+        row["PO date"] = when.strftime("%d-%m-%Y")
+    row["Last contact"] = when.strftime("%d-%m-%Y")
+    return row
+
+
+def flag_maybe_po(row: dict) -> dict:
+    """The mail check thinks this inquiry's latest mail may be a PO, but
+    not unmistakably (review R1). Nothing moves: Status and the stage stay
+    as they are, and "No quotation" reads "maybe" (stage_of() only acts on
+    "yes"), so the card can say "Looks like a PO" until the owner presses
+    "They sent a PO" (mark_po_without_quote) or "Not an order". A "yes"
+    already set is never weakened."""
+    if not _flag(row, NO_QUOTATION):
+        row[NO_QUOTATION] = MAYBE
+    return row
+
+
+def maybe_po(row: dict) -> bool:
+    """True while the row carries flag_maybe_po()'s flag."""
+    return (row.get(NO_QUOTATION) or "").strip().lower() == MAYBE
+
+
+def mark_proforma_due(row: dict, pipeline: dict | None = None,
+                      when: date | None = None) -> bool:
+    """The PO is accepted and a proforma has to go out: Accepted, Proforma
+    "to send". Nothing is recorded as sent — mark_proforma_sent() does
+    that once the letter has actually gone. False, and no change, when the
+    proforma step is off."""
+    if not step_on(pipeline, "proforma"):
+        return False
+    when = when or date.today()
+    row["Status"] = ACCEPTED
+    row[PROFORMA] = PROFORMA_DUE
+    row["Last contact"] = when.strftime("%d-%m-%Y")
+    return True
+
+
+def proforma_due(row: dict) -> bool:
+    return (row.get(PROFORMA) or "").strip().lower() == PROFORMA_DUE
+
+
+def mark_proforma_sent(row: dict, pipeline: dict | None = None,
+                       when: date | None = None) -> bool:
+    """The proforma went out; the order waits for the advance. Only when
+    the client uses the proforma step — otherwise nothing changes and this
+    returns False, so a stray call cannot park an order in a stage the
+    client's board does not have."""
+    if not step_on(pipeline, "proforma"):
+        return False
+    when = when or date.today()
+    row["Status"] = ACCEPTED
+    row[PROFORMA] = PROFORMA_SENT
+    row["Last contact"] = when.strftime("%d-%m-%Y")
+    return True
+
+
+def mark_advance_received(row: dict, pipeline: dict | None = None,
+                          value=None, when: date | None = None) -> bool:
+    """The advance against the proforma arrived: Converted. Keeps the PO
+    number and date already on the row; the order value is `value`, else
+    what is already there, else the quotation's. False, and no change,
+    when the proforma step is off."""
+    if not step_on(pipeline, "proforma"):
+        return False
+    when = when or date.today()
+    row["Status"] = CONVERTED
+    row["Result"] = CONVERTED
+    row[PROFORMA] = PROFORMA_PAID
+    if value is not None:
+        row["Order value"] = money_str(value)
+    elif not (row.get("Order value") or "").strip():
+        row["Order value"] = money_str(row.get("Quotation value") or 0)
+    row["Last contact"] = when.strftime("%d-%m-%Y")
+    return True
+
+
+# Reading the price out of a counter-offer. Strict on purpose: a wrong ask
+# on the card is worse than none, because the owner prices the revision off
+# it. Three things make a number a price — a currency in front, a lakh/k
+# multiplier or "/-" behind, or a price word just before it — and any
+# number that is a quantity, a percentage or a discount is dropped.
+_ASK = re.compile(
+    r"(?<![\w.,/])(?P<cur>(?:₹|rs\.?|inr|usd|eur|gbp|aed|\$|€|£)\s*)?"
+    r"(?P<num>\d[\d,]*(?:\.\d+)?)"
+    r"(?:\s*(?P<mult>lakhs?|lacs?|crores?|cr|thousand|k|l)(?![a-z]))?"
+    r"(?P<dash>\s*/-)?", re.I)
+_GROUPED = re.compile(r"^\d{1,3}(,\d{3})+$|^\d{1,2}(,\d{2})*,\d{3}$|^\d+$")
+_MULTIPLIER = {"lakh": 100000, "lakhs": 100000, "lac": 100000, "lacs": 100000,
+               "l": 100000, "crore": 10000000, "crores": 10000000,
+               "cr": 10000000, "thousand": 1000, "k": 1000}
+# Multipliers that only ever mean money. "k" and "thousand" also count
+# units ("100k units"), so on their own they are not a currency mark.
+_MONEY_MULTIPLIERS = ("lakh", "lakhs", "lac", "lacs", "crore", "crores", "cr")
+# A price word just before the figure. Deliberately no "at", "for", "do" or
+# "pay": "call me at 98765…", "delivery at 380015", "at 2026 rates" and
+# "can you do 100 pcs" are not prices. Those words count only when a
+# currency follows them, which the currency mark already covers.
+_PRICE_BEFORE = re.compile(
+    r"\b(price|rate|budget|offer|amount|total|cost|value|upto|up\s+to|"
+    r"max(imum)?)\b\W{0,3}(of|is|be|:|=|to)?\W{0,3}$", re.I)
+_NOT_A_PRICE_BEFORE = re.compile(
+    r"\b(discount|less|reduc\w*(\s+it)?\s+by|rebate|extra|minus|call\s+(?:me\s+)?at)\b"
+    r"\W{0,3}(of|by)?\W{0,3}$", re.I)
+_NOT_A_PRICE_AFTER = re.compile(r"^\s*(%|percent|off\b|less\b|discount)", re.I)
+# A figure followed by these is a per-unit rate, not the total they ask.
+_PER_UNIT_AFTER = re.compile(
+    r"^\s*(?:@|/\s*-?\s*(?:unit|pc|pcs|piece|kg|nos?|mtr|meter|metre|ltr|set)\b|"
+    r"per\b|each\b|apiece\b|a\s+piece\b)", re.I)
+# Six digits after one of these, with no currency: an Indian PIN code.
+_PIN_BEFORE = re.compile(r"\b(?:pin|pincode|pin\s*code|delivery|deliver(?:ed)?\s+to|at)\b"
+                         r"\W{0,3}$", re.I)
+
+
+def read_ask(text: str, quoted=None) -> Decimal | None:
+    """The price a customer's counter-offer names, or None when unsure.
+
+    Reads "₹1,10,000", "Rs. 110000/-", "$110,000", "1.1 lakh" and
+    "price 1,10,000". Indian and Western digit grouping both, and nothing
+    else — "1,1000" is a typo, not a number to guess at.
+
+    Dropped on purpose (review R2, 2026-10-13): phone numbers (any run of 10+
+    digits), PIN codes (six digits after pin/delivery/at with no currency),
+    per-unit rates ("75000 per kg", "95,000 each", "/unit", "@"), quantities
+    ("100k units", "50 nos"), and percentages or discounts. With no readable
+    quotation total to compare against, only a figure carrying a currency,
+    a "/-" or a lakh/crore is believed. With the quotation's total as
+    `quoted`, a figure that is not a plausible counter (our own price read
+    back, or under 30% of it) is dropped. Two different plausible figures
+    are unsure, so None.
+    """
+    from .quoting import _QTY_UNITS
+    unit_after = re.compile(r"^\s*(?:" + _QTY_UNITS + r")\b", re.I)
+    text = text or ""
+    quoted = money(quoted) if quoted not in (None, "") else Decimal(0)
+    found = set()
+    for m in _ASK.finditer(text):
+        raw = m.group("num").rstrip(",")
+        whole = raw.split(".")[0]
+        if not _GROUPED.match(whole):
+            continue
+        digits = re.sub(r"\D", "", whole)
+        if len(digits) >= 10:
+            continue                  # a phone number, an account number
+        cur, dash = bool(m.group("cur")), bool(m.group("dash"))
+        mult = (m.group("mult") or "").lower()
+        if mult == "l" and not cur:
+            continue                  # "5 l" is litres until a ₹ says otherwise
+        before = text[max(0, m.start() - 30):m.start()]
+        after = text[m.end():m.end() + 15]
+        if _NOT_A_PRICE_BEFORE.search(before) or _NOT_A_PRICE_AFTER.match(after):
+            continue
+        # Units are checked after the multiplier too: "100k units".
+        if _PER_UNIT_AFTER.match(after) or unit_after.match(after):
+            continue
+        if len(digits) == 6 and not cur and _PIN_BEFORE.search(before):
+            continue
+        money_mark = cur or dash or mult in _MONEY_MULTIPLIERS
+        if quoted <= 0 and not money_mark:
+            continue
+        if not (money_mark or mult or _PRICE_BEFORE.search(before)):
+            continue
+        try:
+            value = Decimal(raw.replace(",", "")) * _MULTIPLIER.get(mult, 1)
+        except Exception:                               # noqa: BLE001
+            continue
+        if value <= 0:
+            continue
+        if quoted > 0 and not (quoted * Decimal("0.3") <= value < quoted):
+            continue
+        found.add(value.quantize(Decimal("0.01")))
+    return found.pop() if len(found) == 1 else None
+
+
+def plausible_ask(ask, quoted) -> bool:
+    """True when `ask` can stand as their counter to `quoted`: a positive
+    figure below our total and at least 30% of it. The same band read_ask()
+    uses, for callers holding a value that came from the register file."""
+    try:
+        ask, quoted = money(ask), money(quoted)
+    except Exception:                                   # noqa: BLE001
+        return False
+    return quoted > 0 and quoted * Decimal("0.3") <= ask < quoted
 
 
 # ── money and dates, read back from a file a human has been editing ──────────

@@ -778,6 +778,160 @@ class Quotation:
         return (self.date or date.today()) + timedelta(days=self.terms.validity_days)
 
 
+def scale_to_total(quote: "Quotation", new_total) -> bool:
+    """Scale `quote`'s line rates so quote.total is exactly `new_total`.
+
+    Freight is a fixed figure and the discount and GST are percentages, so
+    the lines are solved for on the taxable base (review R4): scaling every
+    rate by new/old total overshot whenever there was freight. The paise
+    left over by rounding go on a line that can absorb them. True when the
+    total now matches to the paisa; False (lines scaled as near as they
+    go) when it cannot — then the caller must print quote.total, not the
+    figure that was asked for."""
+    target = to_decimal(new_total, "0")
+    if target <= 0 or not quote.lines or not quote.subtotal:
+        return False
+    t = quote.terms
+    gst = Decimal(1) + to_decimal(t.gst_percent, "0") / Decimal(100)
+    keep = Decimal(1) - to_decimal(t.discount_percent, "0") / Decimal(100)
+    if keep <= 0:
+        return False
+    want_sub = (target / gst - to_decimal(t.freight, "0")) / keep
+    if want_sub <= 0:
+        return False
+    factor = want_sub / quote.subtotal
+    for line in quote.lines:
+        line.rate = rupees(line.rate * factor)
+    # Rounding leaves a few paise. Move one line's rate, then two lines'
+    # rates, a paisa at a time, nearest first, until the total lands.
+    if quote.total == target:
+        return True
+    base = [line.rate for line in quote.lines]
+    steps = sorted(range(-300, 301), key=abs)
+    for i, line in enumerate(quote.lines):
+        for d in steps:
+            line.rate = base[i] + Decimal(d) / 100
+            if line.rate > 0 and quote.total == target:
+                return True
+        line.rate = base[i]
+    # Two lines only help when their quantities differ (equal quantities
+    # move the total on the same lattice as one line); capped, so a long
+    # quotation cannot stall the window.
+    small = sorted(range(-25, 26), key=abs)
+    n = min(len(quote.lines), 6)
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n)
+             if quote.lines[i].quantity != quote.lines[j].quantity][:4]
+    for i, j in pairs:
+        for di in small:
+            for dj in small:
+                quote.lines[i].rate = base[i] + Decimal(di) / 100
+                quote.lines[j].rate = base[j] + Decimal(dj) / 100
+                if (quote.lines[i].rate > 0 and quote.lines[j].rate > 0
+                        and quote.total == target):
+                    return True
+        quote.lines[i].rate, quote.lines[j].rate = base[i], base[j]
+    return quote.total == target
+
+
+# ── a PO that came with no quotation behind it ───────────────────────────────
+# The customer ordered straight off a catalogue or an old price. There is no
+# quotation to check the PO against, so its lines are priced from the rate
+# list instead — by the same matching a quotation uses — and the owner sends
+# an order acknowledgement for the customer to confirm. Nothing here sends
+# anything; it hands back the lines and the totals for the draft.
+
+@dataclass
+class PricedOrder:
+    quote: Quotation                                  # lines + the arithmetic
+    unsure: list[str] = field(default_factory=list)   # lines left for a person
+
+    @property
+    def lines(self) -> list[QuoteLine]:
+        return self.quote.lines
+
+    @property
+    def subtotal(self) -> Decimal:
+        return self.quote.subtotal
+
+    @property
+    def tax(self) -> Decimal:
+        return self.quote.gst
+
+    @property
+    def total(self) -> Decimal:
+        return self.quote.total
+
+
+def _rate_line(item: RateItem, quantity: Decimal) -> QuoteLine | None:
+    rate = item.rate_for(quantity)
+    if rate <= 0:
+        return None            # on the list, but with no price to quote
+    return QuoteLine(description=item.description or item.label,
+                     quantity=quantity, unit=item.unit or "nos", rate=rate,
+                     hsn=item.hsn, basis="rate list")
+
+
+def price_order(text: str, items: list[RateItem], *, quantity=None,
+                tax_percent=18) -> PricedOrder:
+    """Price a PO's lines from the rate list. Never sends, never guesses.
+
+    Codes the PO names are exact (find_requests). Without codes, each line
+    that carries a quantity is matched in words and kept only when
+    is_confident() says the best row is clearly ahead. A PO that is one
+    request with its quantity elsewhere — the register's "Product asked"
+    and "Quantity" — is priced from `quantity`. Every line that could not
+    be priced safely is returned in `unsure`, for the owner to price by
+    hand, rather than filled with the nearest-looking row.
+    """
+    terms = Terms(gst_percent=to_decimal(tax_percent, "18"))
+    out = PricedOrder(Quotation(date=date.today(), terms=terms))
+    text = text or ""
+
+    def take(item, qty, evidence):
+        line = _rate_line(item, qty) if qty is not None and qty > 0 else None
+        if line is None:
+            out.unsure.append(evidence)
+        else:
+            out.quote.lines.append(line)
+
+    requests = find_requests(text, items)
+    used = set()
+    for request in requests:
+        take(request.item, request.quantity,
+             request.evidence or request.item.label)
+        if request.evidence:
+            used.add(request.evidence.strip()[:160])
+
+    # Every other line with a quantity goes through the word pass, even when
+    # some lines named codes: a PO that mixes "1128K x 40" with "Gate valve
+    # 50 NB - 10 nos" must never drop the word lines (review R3). Each one is
+    # priced, or listed for the owner — never silently left out.
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    for line in lines:
+        if line[:160] in used:
+            continue
+        qty = _lone_quantity(line)
+        if qty is None:
+            continue
+        matches = match_item(line, items)
+        if is_confident(matches):
+            take(matches[0].item, qty, line[:160])
+        else:
+            out.unsure.append(line[:160])
+    if out.quote.lines or out.unsure or requests:
+        return out
+
+    qty = to_decimal(quantity, "0") if quantity not in (None, "") else None
+    if not qty:
+        qty = _lone_quantity(text)
+    matches = match_item(text, items)
+    if is_confident(matches):
+        take(matches[0].item, qty, (lines[0] if lines else text)[:160])
+    elif text.strip():
+        out.unsure.append((lines[0] if lines else text)[:160])
+    return out
+
+
 def next_quote_number(rows: list[dict], prefix: str = "QTN",
                       when: date | None = None, taken=()) -> str:
     """Next quotation number, counted off the register's Quotation no column.

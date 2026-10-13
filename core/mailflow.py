@@ -89,7 +89,11 @@ class Paths:
             os.makedirs(folder, exist_ok=True)
 
 
-_PRISM_FILE = re.compile(r"^[A-Z]+-\d{2}-\d{2}-\d+\.(csv|pdf|xlsx|txt)$", re.I)
+# QTN-26-27-0101.pdf, and its revisions QTN-26-27-0101-R1.pdf: the -Rn tail
+# is the same number (register.quote_file_name), so a folder holding only
+# the revised PDF still keeps 0101 off the next quotation.
+_PRISM_FILE = re.compile(r"^[A-Z]+-\d{2}-\d{2}-\d+(-R\d+)?\.(csv|pdf|xlsx|txt)$",
+                         re.I)
 
 
 def numbers_in_use(paths: Paths) -> list[str]:
@@ -505,11 +509,45 @@ def _file_prefix(row: dict) -> str:
 
 
 def _reads_as_an_order(message: Message) -> bool:
-    """An attachment, or text that actually names a PO — not just any
-    confirmation-shaped sentence."""
-    if message.attachments:
+    """An attachment named like a PO (signature logos and inline images do
+    not count, see triage.real_attachments), or text that actually names a
+    PO — not just any confirmation-shaped sentence. Enough to LIST a mail as
+    an order; not enough to move a register row (_order_is_certain)."""
+    if triage._po_attachment(message):
         return True
     return bool(_PO_LIKE.search(getattr(message, "body", "") or ""))
+
+
+def _number_key(text: str) -> str:
+    m = register._NUMBER_ANYWHERE.search(text or "")
+    if not m:
+        return ""
+    return f"{m.group(1).upper()}/{m.group(2)}/{int(m.group(3))}"
+
+
+def _names_our_quotation(text: str, rows: list) -> str:
+    """One of our own quotation numbers named in `text`, or ""."""
+    ours = {_number_key(r.get("Quotation no") or ""): (r.get("Quotation no") or "")
+            for r in rows or [] if (r.get("Quotation no") or "").strip()}
+    ours.pop("", None)
+    for m in register._NUMBER_ANYWHERE.finditer(text or ""):
+        key = f"{m.group(1).upper()}/{m.group(2)}/{int(m.group(3))}"
+        if key in ours:
+            return ours[key]
+    return ""
+
+
+def _order_is_certain(message: Message, rows: list) -> bool:
+    """Only an unmistakable order may move a register row on its own (review
+    R1, 2026-10-13): an explicit PO number in what they typed ("PO No. 4512")
+    AND a PO-named attachment, or a mail naming one of our quotation numbers.
+    Anything less — "P.O. Box" in a signature, a drawing from a customer, a
+    "please proceed" — leaves the row where it is, flagged as looking like a
+    PO, for the owner to confirm with "They sent a PO"."""
+    text = f"{getattr(message, 'subject', '') or ''}\n{_own_words(message, 4000)}"
+    if triage.po_number(text) and triage._po_attachment(message):
+        return True
+    return bool(_names_our_quotation(text, rows))
 
 
 def _log_history(folder: str, event: str, message: Message) -> None:
@@ -524,6 +562,28 @@ def _log_history(folder: str, event: str, message: Message) -> None:
                        body=message.body, when=message.date)
     except Exception:                                   # noqa: BLE001
         pass
+
+
+def _note_counter_offer(row: dict, message: Message, intent: str,
+                        today: date) -> None:
+    """A reply asking for a better rate on a quotation we sent moves the row
+    to Negotiating, makes it our turn, and keeps the price they named when
+    register.read_ask() can read one safely. Any other reply on a row that
+    was waiting on them (we asked for details, or held the price) makes it
+    our turn again. The status is only moved for a row that has a
+    quotation still in play — a "best price?" on an inquiry nobody quoted
+    yet is still an inquiry to quote."""
+    status = (row.get("Status") or "").strip()
+    if (intent == NEGOTIATING
+            and (row.get("Quotation no") or "").strip()
+            and status in (register.QUOTED, register.FOLLOWING_UP,
+                           register.NEGOTIATING)):
+        ask = register.read_ask(_own_words(message),
+                                row.get("Quotation value") or None)
+        register.note_counter(row, ask, today)
+        return
+    if (row.get(register.TURN) or "").strip().lower() == register.TURN_THEM:
+        row[register.TURN] = register.TURN_YOU
 
 
 def check(cfg: dict, paths: Paths, *, state: State | None = None,
@@ -630,10 +690,26 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
                 item.note = "a purchase order may be attached"
                 out.orders.append(item)
                 _log_history(folder, "Purchase order received", message)
+                if (not (existing.get("Quotation no") or "").strip()
+                        and (existing.get("Status") or "").strip()
+                        in ("", register.NEW)):
+                    # A PO on an inquiry we never quoted: it is an order now,
+                    # to be priced from the rate list, not one more inquiry
+                    # waiting in "To quote" for a quotation nobody will send.
+                    # Only when the order is unmistakable; otherwise the row
+                    # stays an inquiry, flagged "looks like a PO".
+                    if _order_is_certain(message, rows):
+                        register.mark_po_without_quote(
+                            existing, triage.po_number(_own_words(message, 4000)),
+                            when=today)
+                    else:
+                        register.flag_maybe_po(existing)
+                        item.note = "looks like a purchase order — check it"
             else:
                 item.intent = reply_intent(message, api_key, model)
                 out.replies.append(item)
                 _log_history(folder, "Reply received", message)
+                _note_counter_offer(existing, message, item.intent, today)
             dirty = True
             continue
 
@@ -668,11 +744,26 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
         rows.append(row)
         dirty = True
 
-        item = Item("order" if verdict.category == triage.ORDER else "inquiry",
+        # A first-ever mail the sorter called an ORDER is still listed as an
+        # order (a new correspondent's "please supply 500 units" has nothing
+        # else to be called), but its row is created Accepted / No quotation
+        # only when the order is unmistakable. Otherwise the row is a normal
+        # New inquiry flagged "looks like a PO" (review R1, 2026-10-13): a
+        # false "order" is worse than an honest "I don't know".
+        listed_as_order = verdict.category == triage.ORDER
+        is_new_order = (listed_as_order and _reads_as_an_order(message)
+                        and _order_is_certain(message, rows))
+        item = Item("order" if listed_as_order else "inquiry",
                     message, row, folder, files)
-        if verdict.category == triage.ORDER:
-            item.note = "ordered without a quotation from us"
+        if listed_as_order:
             out.orders.append(item)
+            if is_new_order:
+                item.note = "ordered without a quotation from us"
+                register.mark_po_without_quote(
+                    row, triage.po_number(_own_words(message, 4000)), when=today)
+            else:
+                item.note = "looks like an order — check it"
+                register.flag_maybe_po(row)
             _log_history(folder, "Order received (no prior quotation)", message)
         else:
             out.new_inquiries.append(item)

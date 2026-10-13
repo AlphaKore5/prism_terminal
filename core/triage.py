@@ -143,9 +143,29 @@ def learn(knowledge: Knowledge, msg_or_address, category: str) -> Knowledge:
 _NOREPLY = re.compile(r"^(no[-_.]?reply|do[-_.]?not[-_.]?reply|donotreply|"
                       r"mailer[-_.]?daemon|postmaster|bounce)", re.I)
 
-_PO_WORDS = ("purchase order", "p.o.", "po no", "po number", "po#", "work order",
-             "order confirmation", "release order", "placing the order",
-             "kindly process the order", "order attached")
+# Words that make a customer's mail READ like an order. Only a sorting hint:
+# the mail check never moves a register row on these alone (see po_number()
+# and mailflow._order_is_certain). Every alternative is word-bounded, so
+# "expo no", "tempo now" and "repo number" do not count, and a bare "P.O."
+# never does: in an address ("P.O. Box 1234", "Vasna P.O., Ahmedabad") it
+# means post office, and it sits in a customer's signature on every mail.
+_PO_ABBR = r"p\.?\s?o\.?"
+_PO_PATTERN = re.compile(
+    r"(?<![a-z0-9])(?:purchase\s+orders?|work\s+order|order\s+confirmation|"
+    r"release\s+order|placing\s+the\s+order|kindly\s+process\s+the\s+order|"
+    r"order\s+attached)(?![a-z0-9])"
+    r"|(?<![a-z0-9])" + _PO_ABBR + r"\s*(?:no\b\.?|nos\b\.?|number\b|#|ref\b)"
+    r"|(?<![a-z0-9])(?:our|the|attached|enclosed|herewith|find|sending|"
+    r"releasing|revised)\s+" + _PO_ABBR + r"(?![a-z0-9])(?!\s*\.?\s*box)"
+    r"|(?<![a-z0-9])" + _PO_ABBR + r"(?!\s*\.?\s*box)\s+(?:is\s+)?"
+    r"(?:attached|enclosed)", re.I)
+# An explicit PO number: "PO No. 4512", "P.O. # PO/26/118", "Purchase Order
+# No: 77-A". The token must hold a digit, so "PO No. Box" or "PO number
+# please" is not one.
+_PO_NUMBER = re.compile(
+    r"(?<![a-z0-9])(?:" + _PO_ABBR + r"|purchase\s+order|work\s+order)\s*"
+    r"(?:no\b\.?|number\b|#|ref\b\.?(?:\s*no\b\.?)?)\s*[:.\-#]?\s*"
+    r"(?P<no>[a-z0-9][a-z0-9/\-_.]{0,30})", re.I)
 _PAY_WORDS = ("payment advice", "remittance", "neft", "rtgs", "imps", "utr",
               "credited to your account", "debited", "cheque", "tds certificate",
               "gstr", "e-way bill", "payment received", "transaction alert")
@@ -158,6 +178,19 @@ _PROMO_WORDS = ("unsubscribe", "webinar", "newsletter", "% off", "limited offer"
 
 def _has(text: str, words) -> bool:
     return any(w in text for w in words)
+
+
+def _has_po_words(text: str) -> bool:
+    return bool(_PO_PATTERN.search(text or ""))
+
+
+def po_number(text: str) -> str:
+    """The PO number a mail names explicitly, or "" — never a guess."""
+    for m in _PO_NUMBER.finditer(text or ""):
+        token = m.group("no").rstrip("._-/")
+        if any(c.isdigit() for c in token):
+            return token
+    return ""
 
 
 def rules_pass(msg: Message, knowledge: Knowledge | None = None) -> Verdict:
@@ -203,7 +236,7 @@ def rules_pass(msg: Message, knowledge: Knowledge | None = None) -> Verdict:
     if k.knows(k.vendors, msg):
         return verdict(VENDOR, "a supplier we know")
     if k.knows(k.customers, msg):
-        if _has(both, _PO_WORDS) or _po_attachment(msg):
+        if _has_po_words(both) or _po_attachment(msg):
             return verdict(ORDER, "a customer, and it mentions an order")
         if _has(both, _INQ_WORDS):
             return verdict(INQUIRY, "a customer asking for a rate")
@@ -214,7 +247,7 @@ def rules_pass(msg: Message, knowledge: Knowledge | None = None) -> Verdict:
 
     # 6. Unmistakable words from a stranger. Kept narrow on purpose: a false
     #    "order" is worse than an honest "I don't know".
-    if _po_attachment(msg) and _has(both, _PO_WORDS):
+    if _po_attachment(msg) and _has_po_words(both):
         return verdict(ORDER, "a purchase order is attached")
     if _has(subject, _PAY_WORDS) or _has(both, ("payment advice", "utr no", "neft ref")):
         return verdict(PAYMENT, "reads like a payment message")
@@ -224,10 +257,35 @@ def rules_pass(msg: Message, knowledge: Knowledge | None = None) -> Verdict:
     return Verdict(UNSORTED, "none", "", is_reply)
 
 
+# Signature logos and pasted screenshots ride along as image parts. None of
+# them is a purchase order, whatever they happen to be called.
+_SIGNATURE_IMAGE = re.compile(r"^(image\d*|logo|banner|signature|sig|footer|"
+                              r"outlook|facebook|linkedin|twitter|instagram|"
+                              r"whatsapp|youtube|icon)\b", re.I)
+_SMALL_IMAGE = 30 * 1024
+
+
+def real_attachments(msg: Message) -> list:
+    """The attachments a person attached: not inline images, not small
+    images (logos, social icons), not files named like a signature logo."""
+    out = []
+    for a in getattr(msg, "attachments", None) or []:
+        mime = (getattr(a, "mime", "") or "").lower()
+        name = getattr(a, "name", "") or ""
+        if mime.startswith("image/"):
+            if getattr(a, "inline", False) or _SIGNATURE_IMAGE.match(name):
+                continue
+            data = getattr(a, "data", b"") or b""
+            if data and len(data) < _SMALL_IMAGE:
+                continue
+        out.append(a)
+    return out
+
+
 def _po_attachment(msg: Message) -> bool:
-    return any(re.search(r"\b(po|purchase[\s_-]?order|wo|work[\s_-]?order)\b",
-                         name, re.I)
-               for name in msg.attachment_names)
+    return any(re.search(r"(?<![a-z0-9])(po|purchase[\s_-]?order|wo|work[\s_-]?order)"
+                         r"(?![a-z])", a.name, re.I)
+               for a in real_attachments(msg))
 
 
 # ── the AI pass, for what is left ─────────────────────────────────────────────
