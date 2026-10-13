@@ -79,11 +79,61 @@ class Paths:
         directory separator, so it becomes INQ-25-26-0087 on disk. Reversible
         by eye, which is what matters when somebody is looking for it.
         """
-        return os.path.join(self.inquiries, inquiry_no.replace("/", "-"))
+        name = (inquiry_no or "").strip().replace("/", "-").replace("\\", "-")
+        # Never the inquiries folder itself: a row with no number used to
+        # file its drawings loose among every other inquiry's folders.
+        return os.path.join(self.inquiries, name or "unnumbered")
 
     def ensure(self) -> None:
         for folder in (self.inquiries, self.sops, self.quotations):
             os.makedirs(folder, exist_ok=True)
+
+
+_PRISM_FILE = re.compile(r"^[A-Z]+-\d{2}-\d{2}-\d+\.(csv|pdf|xlsx|txt)$", re.I)
+
+
+def numbers_in_use(paths: Paths) -> list[str]:
+    """Every inquiry and quotation number already given out, from outside
+    the register: the inquiry folders, the quotation files Prism saved in
+    them, and the subjects of the mails it sent. register.next_number() and
+    quoting.next_quote_number() take this as a floor, so a row that drops
+    out of the CSV never gets its number reissued. Never raises — an
+    unreadable folder only means a lower floor."""
+    found: list[str] = []
+    for folder in (paths.inquiries, paths.quotations):
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            continue
+        for entry in entries:
+            found.append(entry.name)
+            if folder != paths.inquiries:
+                continue
+            try:
+                found += [f.name for f in os.scandir(entry.path)
+                          if _PRISM_FILE.match(f.name)]
+            except OSError:
+                pass
+    try:
+        found += [r.get("subject", "") or ""
+                  for r in worklist._read_kind(paths.root, "sent")]
+    except Exception:                                   # noqa: BLE001
+        pass
+    return found
+
+
+def _sent_subjects(paths: Paths) -> dict:
+    """{inquiry no: [subjects of the mails Prism sent on it]} from the sent
+    log — a "Re:" of one of these is a reply to us. Never raises."""
+    out: dict = {}
+    try:
+        for r in worklist._read_kind(paths.root, "sent"):
+            number = (r.get("inquiry_no") or "").strip().upper()
+            if number and r.get("subject"):
+                out.setdefault(number, []).append(r["subject"])
+    except Exception:                                   # noqa: BLE001
+        pass
+    return out
 
 
 # ── pulling the details out of an inquiry ────────────────────────────────────
@@ -390,6 +440,70 @@ def _picture_summary(text: str, limit: int = 140) -> str:
     return f"{words} (read from the picture)" if words else ""
 
 
+def _refresh_unquoted_row(row: dict, message: Message, files: list,
+                          picture_text: str, api_key: str, model: str) -> None:
+    """A customer who writes back on an inquiry we have not quoted yet is
+    usually saying what they actually want ("I want this product, 10
+    pieces", with a picture). Without this the row keeps its first, vague
+    wording ("more information") and nothing in "To quote" shows the new
+    ask. Only fills in what the reply states; never blanks a field."""
+    body = (message.body or "").strip()
+    if not body and not files:
+        return
+    details = extract_details(message, api_key, model) if body else {}
+    product = details.get("product") or (
+        register.product_summary(message) if body else "")
+    if picture_text and (not product or product.lower().startswith("re:")):
+        product = _picture_summary(picture_text)
+    if product:
+        row["Product asked"] = product
+    if details.get("quantity"):
+        row["Quantity"] = details["quantity"]
+    elif body and not row.get("Quantity"):
+        found = re.search(r"(\d[\d,]*)\s*(?:pcs?|pieces?|nos?|units?)\b", body, re.I)
+        if found:
+            row["Quantity"] = found.group(0)
+    if files:
+        old = [n for n in (row.get("Drawing") or "").split(", ") if n and n != "No"]
+        row["Drawing"] = ", ".join(old + [os.path.basename(f) for f in files
+                                          if os.path.basename(f) not in old])
+    when = date.today().strftime("%d-%m-%Y")
+    note = f"Wrote again {when}: {' '.join(body.split())[:120]}" if body else f"Sent a file {when}"
+    row["Notes"] = (f"{row['Notes']} | {note}" if row.get("Notes") else note)
+
+
+def _save_mail(folder: str, message: Message, row: dict) -> str:
+    """Keep the mail itself in the inquiry's folder as an .eml — the file
+    Outlook, Apple Mail and Thunderbird open as the original, pictures and
+    all. history.txt keeps the readable text; this keeps the evidence.
+    Never fails the check: returns "" when there is nothing to write."""
+    raw = getattr(message, "raw", b"") or b""
+    if not raw or not folder:
+        return ""
+    when = message.date.strftime("%Y-%m-%d_%H%M") if message.date else "undated"
+    stem = f"{_file_prefix(row) or 'mail'}_mail_{when}"
+    # Written once, then let go: the decoded attachments are already held,
+    # and a second copy of a 20 MB drawing per mail adds up on a laptop.
+    message.raw = b""
+    try:
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"{stem}.eml")
+        for n in range(2, 100):
+            if not os.path.exists(path):
+                break
+            path = os.path.join(folder, f"{stem}-{n}.eml")
+        with open(path, "wb") as f:
+            f.write(raw)
+        return path
+    except OSError:
+        return ""
+
+
+def _file_prefix(row: dict) -> str:
+    """INQ-26-27-0005 — what a saved attachment's name starts with."""
+    return (row.get("Inquiry no") or "").strip().replace("/", "-")
+
+
 def _reads_as_an_order(message: Message) -> bool:
     """An attachment, or text that actually names a PO — not just any
     confirmation-shaped sentence."""
@@ -463,13 +577,24 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
     except register.RegisterLocked as e:
         out.error = str(e)
         return out
+    # The rows as read. The owner keeps working on screen while this runs
+    # (deleting rows, sending quotations), so the save at the end applies
+    # only what this check changed onto the file as it is by then.
+    as_read = register.snapshot(rows)
 
     dirty = False
+    taken = None          # numbers_in_use(), read once and only when needed
+    sent = None           # subjects of mails we sent, per inquiry, for matching
     for message, verdict in zip(messages, verdicts):
         if not verdict.actionable:
+            # Its .eml is never written; holding every newsletter's raw
+            # MIME (attachments and all) for the rest of the check is what
+            # doubled the memory a large inbox took.
+            message.raw = b""
             continue
 
-        existing = register.find_by_thread(rows, message)
+        sent = sent if sent is not None else _sent_subjects(paths)
+        existing, how = register.match(rows, message, sent)
 
         # A reply on an inquiry we already know about is never a new inquiry,
         # whatever the sorter called it — otherwise a three-message
@@ -477,10 +602,26 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
         if existing is not None:
             register.add_thread(existing, message)
             existing["Last contact"] = today.strftime("%d-%m-%Y")
+            if not (existing.get("Inquiry no") or "").strip():
+                # A hand-kept row with no number of its own: give it one now,
+                # or its files would have nowhere of their own to go.
+                taken = taken if taken is not None else numbers_in_use(paths)
+                existing["Inquiry no"] = register.next_number(
+                    rows, "INQ", message.date or today, taken)
             folder = existing.get("Folder") or paths.folder_for(
-                existing.get("Inquiry no", "unknown"))
-            files = inbox.save_attachments(message, folder)
-            _read_pictures(files, folder)
+                existing.get("Inquiry no", ""))
+            files = inbox.save_attachments(message, folder,
+                                           _file_prefix(existing))
+            _save_mail(folder, message, existing)
+            picture_text = _read_pictures(files, folder)
+            # Only a mail that is certainly on this inquiry (its thread, or
+            # it names the number) may rewrite what the row says was asked.
+            # A subject match is likely, not certain, and a wrong refresh
+            # erases the first enquiry from "To quote".
+            if ((existing.get("Status") or register.NEW) == register.NEW
+                    and how in (register.BY_THREAD, register.BY_NUMBER)):
+                _refresh_unquoted_row(existing, message, files, picture_text,
+                                      api_key, model)
             is_order = (verdict.category == triage.ORDER
                        and _reads_as_an_order(message))
             item = Item("order" if is_order else "reply",
@@ -500,7 +641,8 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
         # still an order — it gets a row so it can be tracked, marked as
         # having skipped the quotation stage.
         details = extract_details(message, api_key, model)
-        row = register.from_message(message, details, rows=rows)
+        taken = taken if taken is not None else numbers_in_use(paths)
+        row = register.from_message(message, details, rows=rows, taken=taken)
         folder = paths.folder_for(row["Inquiry no"])
         row["Folder"] = folder
         # Made even when nothing was attached. The register points at this
@@ -508,7 +650,8 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
         # land in it later — a path in the file that opens onto nothing is the
         # kind of small broken thing that makes people stop trusting the rest.
         os.makedirs(folder, exist_ok=True)
-        files = inbox.save_attachments(message, folder)
+        files = inbox.save_attachments(message, folder, _file_prefix(row))
+        _save_mail(folder, message, row)
         if files:
             row["Drawing"] = ", ".join(os.path.basename(f) for f in files)
         # A customer who sends a picture instead of words: read the text in
@@ -537,7 +680,7 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
 
     if dirty:
         try:
-            register.save(rows, paths.register_csv)
+            rows = register.save_changes(rows, paths.register_csv, as_read)
         except register.RegisterLocked as e:
             # The work is done and in memory; only the write failed. Say so —
             # the owner can close Excel and press check again, and nothing is

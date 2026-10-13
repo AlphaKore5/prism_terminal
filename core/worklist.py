@@ -293,6 +293,22 @@ def resolve(folder: str, kind: str, message_id: str) -> dict:
     return update(folder, kind, message_id, {"resolved": True})
 
 
+def resolve_many(folder: str, kind: str, message_ids) -> dict:
+    """resolve() for several mails at once, in one write — what "Delete"
+    on a multi-row selection in "They answered" or "Order came" does. The
+    mail only leaves that list; the inquiry it belongs to is not touched."""
+    wanted = {m for m in message_ids if m}
+    migrate(folder)
+    rows = _read_kind(folder, kind)
+    for row in rows:
+        if row.get("message_id") in wanted:
+            row["resolved"] = True
+    _write_kind(folder, kind, rows)
+    data = load(folder)
+    data[kind] = rows
+    return data
+
+
 def log_sent(folder: str, kind: str, *, to: str, subject: str,
              inquiry_no: str = "", quotation_no: str = "",
              when: datetime | None = None) -> dict:

@@ -91,15 +91,24 @@ def fy_label(when: date | datetime | None = None) -> str:
 
 _NUMBER = re.compile(r"^([A-Z]+)/(\d{2}-\d{2})/(\d+)$", re.I)
 
+# The same number as it appears on disk and in a mail: the folder spelling
+# INQ-26-27-0005, a file QTN-26-27-0001.csv, a subject "Quotation
+# QTN/26-27/0001 — springs".
+_NUMBER_ANYWHERE = re.compile(r"(?<![A-Za-z0-9])([A-Z]+)[/-](\d{2}-\d{2})[/-](\d+)(?!\d)",
+                              re.I)
+
 
 def next_number(rows: list[dict], prefix: str = "INQ",
-                when: date | datetime | None = None) -> str:
+                when: date | datetime | None = None, taken=()) -> str:
     """The next number in this financial year, e.g. INQ/25-26/0088.
 
     Counts from what is in the file rather than from a stored counter, so
-    deleting the last row genuinely undoes it and two people numbering on
-    different machines cannot both be told "0088" by a counter that only one
-    of them updated.
+    deleting the last row genuinely undoes it. `taken` is everything else
+    that already carries a number — the inquiry folders on disk, the
+    quotation files, the subjects of quotations already sent. A row can drop
+    out of the CSV (a stale copy saved over it, a hand edit in Excel), and
+    without this floor its number was handed out again, into a folder that
+    still held the first job's drawings and history.
     """
     year = fy_label(when)
     highest = 0
@@ -107,6 +116,10 @@ def next_number(rows: list[dict], prefix: str = "INQ",
         match = _NUMBER.match((row.get("Inquiry no") or "").strip())
         if match and match.group(1).upper() == prefix.upper() and match.group(2) == year:
             highest = max(highest, int(match.group(3)))
+    for text in taken or ():
+        for found in _NUMBER_ANYWHERE.finditer(str(text or "")):
+            if found.group(1).upper() == prefix.upper() and found.group(2) == year:
+                highest = max(highest, int(found.group(3)))
     return f"{prefix.upper()}/{year}/{highest + 1:04d}"
 
 
@@ -126,11 +139,133 @@ def load(path: str) -> list[dict]:
         return []
     try:
         with open(path, "r", encoding="utf-8-sig", newline="") as f:
-            return [dict(r) for r in csv.DictReader(f)
-                    if any((v or "").strip() for v in r.values())]
+            reader = csv.DictReader(f)
+            names = _canonical_headers(reader.fieldnames or [])
+            return [{names.get(k, k): v for k, v in r.items()}
+                    for r in reader
+                    if any((v or "").strip() for v in r.values()
+                           if isinstance(v, str))]
     except OSError as e:
         raise RegisterLocked(
             f"Couldn't read the inquiry register: {e}") from e
+
+
+def _squash(name) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+
+
+# Headers a hand-kept sheet uses for the columns Prism knows, squashed to
+# letters and digits. "Inquiry No." is the one that mattered: read as an
+# unknown column, every imported row had a blank number, so they all shared
+# one "folder" (the inquiries folder itself) and one row on screen.
+_HEADER_ALIASES = {
+    "inquiryno": "Inquiry no", "inquirynumber": "Inquiry no",
+    "enquiryno": "Inquiry no", "enquirynumber": "Inquiry no",
+    "enqno": "Inquiry no", "inqno": "Inquiry no",
+    "emailid": "Email", "emailaddress": "Email", "mail": "Email",
+    "phoneno": "Phone", "mobile": "Phone", "mobileno": "Phone",
+    "contactno": "Phone",
+    "qty": "Quantity", "product": "Product asked",
+    "quotationnumber": "Quotation no", "quoteno": "Quotation no",
+    "qtnno": "Quotation no", "ponumber": "PO number", "pono": "PO number",
+}
+
+
+def _canonical_headers(fieldnames: list) -> dict:
+    """{header as written: Prism's own name} for headers that only differ in
+    case, punctuation or a common synonym. A header already spelled Prism's
+    way is never displaced by a look-alike in the same file."""
+    present = {n for n in fieldnames if n in COLUMNS}
+    exact = {_squash(c): c for c in COLUMNS}
+    out = {}
+    for name in fieldnames:
+        if name is None or name in COLUMNS:
+            continue
+        target = exact.get(_squash(name)) or _HEADER_ALIASES.get(_squash(name))
+        if target and target not in present:
+            out[name] = target
+            present.add(target)
+    return out
+
+
+LOCK_WAIT = 5.0        # seconds a writer waits for another one to finish
+LOCK_STALE = 30.0      # a lock older than this was left by a crashed writer
+
+
+class _Locked:
+    """`inquiries.csv.lock`, held around every read-modify-write.
+
+    The mail check and the inquiry screen both rewrite the register, and
+    each of them reads it first. Without a lock the one that wrote last
+    erased whatever the other had written between its read and its write.
+    The lock is a plain file made with O_EXCL — the one create that is
+    atomic on Windows, macOS and network shares alike. A lock left behind
+    by a crash is taken over once it is LOCK_STALE old. When the wait runs
+    out the write is refused with a plain message rather than made anyway.
+    """
+
+    def __init__(self, path: str):
+        self.lock = f"{path}.lock"
+        self.held = False
+
+    def __enter__(self):
+        import time
+        os.makedirs(os.path.dirname(os.path.abspath(self.lock)), exist_ok=True)
+        deadline = time.monotonic() + LOCK_WAIT
+        while True:
+            try:
+                fd = os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                pass
+            except PermissionError:
+                # Windows: a lock file being deleted by its owner right now
+                # reads as "access denied" for a moment. Same as busy.
+                pass
+            except OSError as e:
+                raise RegisterLocked(f"Couldn't write the inquiry register: {e}") from e
+            else:
+                try:
+                    os.write(fd, f"{os.getpid()} {time.time():.0f}".encode())
+                finally:
+                    os.close(fd)
+                self.held = True
+                return self
+            try:
+                if time.time() - os.path.getmtime(self.lock) > LOCK_STALE:
+                    _retry(os.unlink, self.lock)
+                    continue
+            except OSError:
+                pass       # gone already, or still held: try again
+            if time.monotonic() >= deadline:
+                raise RegisterLocked(
+                    "Prism is still saving the inquiry register from another "
+                    "window or computer. Try again in a moment — nothing has "
+                    "been lost.")
+            time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        if self.held:
+            try:
+                _retry(os.unlink, self.lock)
+            except OSError:
+                pass       # LOCK_STALE recovers it
+            self.held = False
+        return False
+
+
+def _retry(action, *args, attempts: int = 10):
+    """Run a file operation, retrying a PermissionError for about half a
+    second. On Windows os.replace() and os.unlink() fail while a virus
+    scanner, the search indexer or a sync client has the file open for a
+    moment; a real lock (Excel) outlasts the retries and is reported."""
+    import time
+    for attempt in range(attempts):
+        try:
+            return action(*args)
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05)
 
 
 def save(rows: list[dict], path: str) -> None:
@@ -140,6 +275,11 @@ def save(rows: list[dict], path: str) -> None:
     quietly deleted the next time Prism touches the file — which would be a
     very fast way to lose somebody's trust in it.
     """
+    with _Locked(path):
+        _write(rows, path)
+
+
+def _write(rows: list[dict], path: str) -> None:
     folder = os.path.dirname(os.path.abspath(path))
     os.makedirs(folder, exist_ok=True)
 
@@ -159,13 +299,122 @@ def save(rows: list[dict], path: str) -> None:
                 writer.writerow({c: row.get(c, "") for c in columns})
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        _retry(os.replace, tmp, path)
     except PermissionError as e:
         _cleanup(tmp)
         raise _friendly_lock(path) from e
     except OSError as e:
         _cleanup(tmp)
         raise RegisterLocked(f"Couldn't write the inquiry register: {e}") from e
+
+
+def row_keys(rows: list[dict]) -> set:
+    """What identifies each row — kept by a screen next to the rows it read,
+    so save_merged() can tell a row it deleted from one added since."""
+    return {k for k in (_merge_key(r) for r in rows) if k is not None}
+
+
+def save_merged(rows: list[dict], path: str, known: set | None = None) -> list[dict]:
+    """Save a list read earlier without erasing rows added to the file since.
+
+    The inquiry screen holds the register in memory and writes it back after
+    an edit. Between the read and the write a mail check, a second Prism on
+    a shared folder, or the owner in Excel may have added a row; a plain
+    save() wiped it, and the next check handed its number out again.
+
+    `known` is row_keys() of the list as it was read. A row on disk that is
+    in neither `rows` nor `known` was added since and is kept, after ours.
+    A row in `known` but not in `rows` was deleted on purpose and stays
+    gone. Without `known` this is a plain save(). Returns the rows kept.
+    """
+    if known is None:
+        save(rows, path)
+        return []
+    with _Locked(path):
+        try:
+            on_disk = load(path)
+        except RegisterLocked:
+            on_disk = []
+        mine = row_keys(rows)
+        # A hand-kept row with no number is known by (Email, Date, Product).
+        # If a check numbered it after this list was read, its key on disk
+        # changed and it looked "added since" — the same row twice. It is
+        # the row we hold: it takes the number (and folder and thread) the
+        # check gave it, unless we deleted it.
+        unnumbered = {_triple_key(r): r for r in rows
+                      if not (r.get("Inquiry no") or "").strip()
+                      and _triple_key(r) is not None}
+        added = []
+        for r in on_disk:
+            key = _merge_key(r)
+            if key is None or key in mine or key in known:
+                continue
+            triple = _triple_key(r)
+            if key[0] == "no" and triple is not None and triple in unnumbered:
+                ours = unnumbered.pop(triple)
+                for column in ("Inquiry no", "Folder", "Thread"):
+                    if not (ours.get(column) or "").strip():
+                        ours[column] = r.get(column, "")
+                continue
+            if key[0] == "no" and triple is not None and triple in known:
+                continue          # numbered since, and deleted here since
+            added.append(r)
+        _write(list(rows) + added, path)
+    return added
+
+
+def snapshot(rows: list[dict]) -> list:
+    """What save_changes() compares against: each row as it was read."""
+    return [(row, _merge_key(row), dict(row)) for row in rows]
+
+
+# Columns where both sides' additions are kept when the file changed under
+# us: thread ids are a set, notes and the drawing list only ever grow.
+_APPENDED = {"Notes": " | ", "Drawing": ", "}
+
+
+def save_changes(rows: list[dict], path: str, before: list) -> list[dict]:
+    """Write back only what this run changed, onto the file as it is now.
+
+    The mail check reads the register, spends a minute on AI calls and
+    OCR, then writes. A plain save() of its copy brought back rows the
+    owner deleted meanwhile and reverted statuses and quotation numbers
+    recorded on screen. Instead, under the lock: re-read the file, append
+    the rows this run added, and on rows that were already there apply
+    only the fields this run changed (`before` is snapshot() of the rows
+    as read). A row deleted on disk meanwhile stays deleted. A field the
+    owner changed meanwhile keeps the owner's value, except Thread (both
+    sets of ids) and Notes/Drawing (our addition appended to theirs).
+    Returns the rows now in the file.
+    """
+    originals = {id(row) for row, _key, _old in before}
+    added = [r for r in rows if id(r) not in originals]
+    with _Locked(path):
+        on_disk = load(path)
+        index = {}
+        for r in on_disk:
+            key = _merge_key(r)
+            if key is not None:
+                index.setdefault(key, r)
+        for row, key, old in before:
+            if key is None or (target := index.get(key)) is None:
+                continue
+            for column in set(row) | set(old):
+                new, was = row.get(column, "") or "", old.get(column, "") or ""
+                if new == was:
+                    continue
+                now = target.get(column, "") or ""
+                if now == was:
+                    target[column] = new
+                elif column == "Thread":
+                    target[column] = " ".join(sorted(set(now.split()) | set(new.split())))
+                elif column in _APPENDED and new.startswith(was):
+                    extra = new[len(was):].lstrip(_APPENDED[column])
+                    target[column] = (f"{now}{_APPENDED[column]}{extra}"
+                                      if now and extra else (now or extra))
+        merged = on_disk + added
+        _write(merged, path)
+    return merged
 
 
 def _cleanup(tmp: str) -> None:
@@ -196,32 +445,123 @@ def thread_key(message) -> str:
     return " ".join(sorted({i.strip() for i in ids if i.strip()}))
 
 
-def find_by_thread(rows: list[dict], message) -> dict | None:
-    """The row this message belongs to, by conversation then by sender.
+_REPLY_PREFIX = re.compile(r"^\s*((re|fw|fwd|aw|wg)\s*(\[\d+\])?\s*:\s*)+", re.I)
 
-    Thread identifiers are exact and are tried first. Falling back to "an open
-    inquiry from the same address" catches the very common case of a customer
-    replying from their phone with a client that starts a fresh thread — and
-    it is limited to OPEN inquiries so a new job from an old customer is not
-    swallowed into last year's closed row.
+def _subject_core(subject: str) -> str:
+    """The subject without its Re:/Fwd: prefixes, lower-cased, one-spaced."""
+    return " ".join(_REPLY_PREFIX.sub("", subject or "").lower().split())
+
+
+def _same_subject(a: str, b: str) -> bool:
+    """One subject is the other, or begins it, word for word — "Enquiry for
+    springs" and "Enquiry for springs — please quote 5000". Whole words, so
+    "Re: Hi" is not a reply to an inquiry about hinges."""
+    a, b = re.findall(r"\w+", a), re.findall(r"\w+", b)
+    if not a or not b:
+        return False
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    return long_[:len(short)] == short
+
+
+def _reads_as_reply(message) -> bool:
+    """A Re:/Fwd: subject, or reply headers pointing at an earlier mail."""
+    return bool(_REPLY_PREFIX.match(getattr(message, "subject", "") or "")
+                or (getattr(message, "in_reply_to", "") or "").strip()
+                or list(getattr(message, "references", []) or []))
+
+
+def _names_row(text: str, row: dict) -> bool:
+    """Whether the mail quotes this row's inquiry or quotation number, in
+    either the INQ/26-27/0005 or the folder's INQ-26-27-0005 spelling."""
+    for column in ("Inquiry no", "Quotation no"):
+        number = (row.get(column) or "").strip()
+        if len(number) < 4:
+            continue
+        for spelling in {number, number.replace("/", "-")}:
+            pattern = r"(?<![\w/-])" + re.escape(spelling) + r"(?![\w/-])"
+            if re.search(pattern, text, re.I):
+                return True
+    return False
+
+
+def find_by_thread(rows: list[dict], message, sent=None) -> dict | None:
+    """The row this message belongs to, or None when it is new business.
+    See match() for the rules."""
+    return match(rows, message, sent)[0]
+
+
+# How match() tied a mail to a row. Only the first two are certain enough
+# to let the mail rewrite what the row says was asked.
+BY_THREAD, BY_NUMBER, BY_SUBJECT = "thread", "number", "subject"
+
+
+def match(rows: list[dict], message, sent=None) -> tuple[dict | None, str]:
+    """(row, how) for the row this message belongs to; (None, "") when it is
+    new business.
+
+    Thread identifiers are exact and are tried first. After that a mail only
+    joins an earlier inquiry from the same address when it clearly belongs
+    to it:
+
+      · it names that inquiry's number or its quotation number;
+      · it is a reply (Re:/Fwd: subject, or reply headers) and its subject,
+        without the Re:/Fwd:, is that open inquiry's "Product asked" or the
+        subject of a mail we sent on it. `sent` is {inquiry no: [subjects]}
+        from the sent log.
+
+    Everything else is a new inquiry with its own number, even from a
+    customer who has one open — the owner's rule is that a mail joins only
+    when it is clearly a reply. Folding a fresh "Enquiry for lockers" into
+    last week's springs row gave two jobs one number, one folder and one
+    "Product asked", and the second job never showed up in "To quote". A
+    forwarded "Fwd: Enquiry for SS lockers" is the same thing: purchase
+    departments forward plant requirements as new enquiries. And a mail
+    with no reply markers at all — "SS Locker 8 Comp", "Urgent", an empty
+    subject — is never taken as an answer to a quotation. Closed inquiries
+    never catch a subject match, so a new job from an old customer is not
+    swallowed into last year's row.
     """
     ids = {i for i in thread_key(message).split() if i}
     if ids:
         for row in rows:
             known = {i for i in (row.get("Thread") or "").split() if i}
             if known & ids:
-                return row
+                return row, BY_THREAD
     sender = (getattr(message, "from_addr", "") or "").strip().lower()
     if not sender:
-        return None
-    open_rows = [r for r in rows
-                 if (r.get("Email") or "").strip().lower() == sender
-                 and (r.get("Status") or "").strip() in OPEN_STATUSES]
-    return open_rows[-1] if open_rows else None
+        return None, ""
+    mine = [r for r in rows if (r.get("Email") or "").strip().lower() == sender]
+    if not mine:
+        return None, ""
+
+    subject = getattr(message, "subject", "") or ""
+    text = f"{subject}\n{(getattr(message, 'body', '') or '')[:8000]}"
+    for row in reversed(mine):
+        if _names_row(text, row):
+            return row, BY_NUMBER
+
+    if not _reads_as_reply(message):
+        return None, ""
+    core = _subject_core(subject)
+    if not core:
+        return None, ""
+    for row in reversed(mine):
+        if (row.get("Status") or "").strip() not in OPEN_STATUSES:
+            continue
+        ours = [row.get("Product asked") or ""]
+        ours += list((sent or {}).get((row.get("Inquiry no") or "").strip().upper(), ()))
+        for text in ours:
+            if _same_subject(core, _subject_core(text)):
+                return row, BY_SUBJECT
+    return None, ""
 
 
 def find(rows: list[dict], inquiry_no: str) -> dict | None:
     wanted = (inquiry_no or "").strip().upper()
+    if not wanted:
+        # A blank number names nothing. Matching it returned the first row
+        # with a blank number, so every unnumbered row read as that one.
+        return None
     for row in rows:
         if (row.get("Inquiry no") or "").strip().upper() == wanted:
             return row
@@ -295,7 +635,8 @@ def product_summary(message) -> str:
 
 
 def from_message(message, details: dict | None = None, *, prefix: str = "INQ",
-                 rows: list[dict] | None = None, folder: str = "") -> dict:
+                 rows: list[dict] | None = None, folder: str = "",
+                 taken=()) -> dict:
     """A fresh register row for a message that triage called an inquiry.
 
     `details` is whatever the extraction step worked out — product, quantity,
@@ -306,7 +647,8 @@ def from_message(message, details: dict | None = None, *, prefix: str = "INQ",
     details = details or {}
     row = blank_row()
     row["Inquiry no"] = next_number(rows or [], prefix,
-                                    getattr(message, "date", None) or date.today())
+                                    getattr(message, "date", None) or date.today(),
+                                    taken)
     when = getattr(message, "date", None)
     row["Date received"] = when.strftime("%d-%m-%Y") if when else date.today().strftime("%d-%m-%Y")
     # Only from a real timestamp. A row that fell back to today's date must
@@ -363,6 +705,10 @@ def _merge_key(row: dict):
     no = (row.get("Inquiry no") or "").strip()
     if no:
         return ("no", no.lower())
+    return _triple_key(row)
+
+
+def _triple_key(row: dict):
     triple = ((row.get("Email") or "").strip().lower(),
               (row.get("Date received") or "").strip(),
               (row.get("Product asked") or "").strip().lower())

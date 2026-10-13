@@ -372,6 +372,9 @@ class Message:
     list_unsubscribe: str = ""
     auto_submitted: str = ""
     precedence: str = ""
+    # The mail exactly as it arrived, so an inquiry's folder can keep the
+    # original (.eml) beside its attachments. Not shown, not compared.
+    raw: bytes = field(default=b"", repr=False, compare=False)
 
     @property
     def sender_domain(self) -> str:
@@ -454,6 +457,7 @@ def parse_message(raw: bytes, uid: int = 0) -> Message:
     """
     msg = email.message_from_bytes(raw)
     out = Message(uid=uid)
+    out.raw = raw if isinstance(raw, (bytes, bytearray)) else b""
     out.message_id = (msg.get("Message-ID") or "").strip()
     out.subject = _header(msg, "Subject")
     out.in_reply_to = (msg.get("In-Reply-To") or "").strip()
@@ -678,19 +682,31 @@ def safe_name(name: str, fallback: str = "attachment") -> str:
     return name[:120]
 
 
-def save_attachments(msg: Message, folder: str) -> list[str]:
+def save_attachments(msg: Message, folder: str, prefix: str = "") -> list[str]:
     """Write a message's attachments into `folder`. Returns the paths written.
 
     Names collide constantly — every second customer attaches "drawing.pdf" —
     so a numeric suffix is added rather than overwriting, because the file that
     would be lost is the one somebody is about to quote from.
+
+    `prefix` (the inquiry number, INQ-26-27-0005) goes in front of the
+    sender's own name: a phone's "3F2A9C.jpeg" copied to the desktop or
+    attached to a mail of ours still says which inquiry it came from. The
+    sender's name and the extension are kept after it.
     """
     if not msg.attachments:
         return []
     os.makedirs(folder, exist_ok=True)
+    prefix = safe_name(prefix, fallback="") if prefix else ""
     written = []
     for att in msg.attachments:
         name = safe_name(att.name)
+        if prefix and not name.lower().startswith(prefix.lower()):
+            stem, dot, ext = name.rpartition(".")
+            if dot and len(ext) <= 8:
+                name = f"{prefix}_{stem[:110 - len(prefix)]}.{ext}"
+            else:
+                name = f"{prefix}_{name}"[:120]
         path = os.path.join(folder, name)
         if os.path.exists(path):
             stem, dot, ext = name.rpartition(".")
