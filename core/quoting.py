@@ -328,7 +328,9 @@ _STOPWORDS = {"the", "a", "an", "of", "for", "and", "or", "with", "in", "on",
               "send", "quote", "quotation", "rate", "rates", "price", "prices",
               "pcs", "nos", "no", "qty", "quantity", "dear", "sir", "madam",
               "regards", "thanks", "thank", "you", "we", "our", "us", "is",
-              "are", "be", "as", "per", "your"}
+              "are", "be", "as", "per", "your", "this", "that", "these",
+              "those", "item", "items", "piece", "pieces", "pc", "product",
+              "products"}
 
 _TOKEN = re.compile(r"[a-z]+|\d+(?:\.\d+)?")
 
@@ -340,8 +342,24 @@ def tokens(text: str) -> list[str]:
     "2 mm wire 25 od" is a specification, and dropping the digits would leave
     "mm wire od", which matches every spring ever made.
     """
-    return [t for t in _TOKEN.findall((text or "").lower())
-            if t not in _STOPWORDS and len(t) > 1]
+    # A lone digit is kept: "8 Comp" is what tells an 8-compartment locker
+    # from the 6 and the 10 beside it. Only as a word of its own, though:
+    # the 2 of "2mm" is glued to its unit, and counting it made every 2 mm
+    # row on a spring list look alike, so an exact "2mm wire 30 OD" stopped
+    # reading as confident (devtools/scenarios.py, "exact spec").
+    lowered = (text or "").lower()
+    out = []
+    for found in _TOKEN.finditer(lowered):
+        t = found.group()
+        if t in _STOPWORDS:
+            continue
+        if len(t) > 1:
+            out.append(t)
+        elif (t.isdigit()
+              and not lowered[found.end():found.end() + 1].isalpha()
+              and not lowered[max(0, found.start() - 1):found.start()].isalpha()):
+            out.append(t)
+    return out
 
 
 @dataclass
@@ -376,8 +394,16 @@ def match_item(query: str, items: list[RateItem], limit: int = 5) -> list[Match]
     # How many rows each word appears in — a word in every row tells us nothing.
     frequency: dict[str, int] = {}
     row_tokens = []
+    wanted_set = set(wanted)
     for item in items:
-        item_tokens = set(tokens(f"{item.code} {item.description} {item.group}"))
+        # The code's own digits are not specification: "8 Comp" must not
+        # also match the row whose code happens to be "KJP 8". The code
+        # counts only when the request names it (its letters appear).
+        code_tokens = tokens(item.code)
+        names_code = any(not t.isdigit() and t in wanted_set for t in code_tokens)
+        item_tokens = set(tokens(f"{item.description} {item.group}"))
+        if names_code:
+            item_tokens |= set(code_tokens)
         row_tokens.append(item_tokens)
         for token in item_tokens:
             frequency[token] = frequency.get(token, 0) + 1
@@ -753,15 +779,18 @@ class Quotation:
 
 
 def next_quote_number(rows: list[dict], prefix: str = "QTN",
-                      when: date | None = None) -> str:
+                      when: date | None = None, taken=()) -> str:
     """Next quotation number, counted off the register's Quotation no column.
 
     Shares register.next_number's rule so both books run on the same financial
-    year and neither can drift from the other.
+    year and neither can drift from the other. `taken` is the floor from
+    outside the register (mailflow.numbers_in_use): a row that lost its
+    Quotation no must not make the next quotation reuse a number a customer
+    already holds on paper.
     """
     from . import register
     fake = [{"Inquiry no": r.get("Quotation no", "")} for r in rows]
-    return register.next_number(fake, prefix, when)
+    return register.next_number(fake, prefix, when, taken)
 
 
 def indian_currency(value: Decimal) -> str:
