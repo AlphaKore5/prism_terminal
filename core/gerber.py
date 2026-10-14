@@ -233,12 +233,25 @@ def _sniff(path: str) -> str:
         return "gerber"
     if re.search(r"^M48\b", head, re.M) or re.search(r"^M7[12]\b", head, re.M):
         return "excellon"
-    if re.search(r"^T\d+\b.*?[CF]\d", head, re.M) and re.search(r"^X[\d.+-]", head, re.M):
-        return "excellon"
+    # Both of the next two checks also demand a `%` somewhere in the file.
     # Some tools ship a drill with no M48 header at all — just `%` and then
     # `T1C.008F0S0`. Reading only the header reported such a job as having
-    # no drill file, on a board with 3,104 holes.
-    if re.search(r"^T\d+\s*C\s*\.?\d", head, re.M):
+    # no drill file, on a board with 3,104 holes — which is why the check
+    # below cannot simply require M48/M71. But every real Excellon file
+    # still has the `%`, header or not: it is what excellon() itself
+    # splits the body on. Without that requirement, a tool-table-looking
+    # line plus an X-looking line ANYWHERE in an unrelated plain-text file
+    # — a BOM, a dimension note, a panel drawing's legend — was enough to
+    # call that file Excellon. excellon() then had no `%` to find the body
+    # with either, so it fell back to scanning the WHOLE file for hit
+    # lines, and a dimension note like "X12.5 Y8.3" elsewhere in that same
+    # file read as a real drilled hole. A fab engineer testing a job with
+    # no drill data at all got a synthetic drill file back because of
+    # exactly this.
+    if "%" in head and re.search(r"^T\d+\b.*?[CF]\d", head, re.M) \
+            and re.search(r"^X[\d.+-]", head, re.M):
+        return "excellon"
+    if "%" in head and re.search(r"^T\d+\s*C\s*\.?\d", head, re.M):
         return "excellon"
     if re.search(r"Tool\s+Hole Size|NCDrill File Report|Aperture|Report For:"
                  r"|Generation Report|Layer Extension", head, re.I):
