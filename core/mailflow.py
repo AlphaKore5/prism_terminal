@@ -646,15 +646,22 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
     taken = None          # numbers_in_use(), read once and only when needed
     sent = None           # subjects of mails we sent, per inquiry, for matching
     for message, verdict in zip(messages, verdicts):
-        if not verdict.actionable:
+        sent = sent if sent is not None else _sent_subjects(paths)
+        existing, how = register.match(rows, message, sent)
+        # A mail the sorter could not place (UNSORTED) that sits on an open
+        # inquiry's own thread is still that customer's reply — a plain
+        # "Confirmed, please proceed" carries none of the sorter's words.
+        # Thread membership outranks the sorter's guess; a newsletter or
+        # anything else the sorter placed stays out.
+        on_open_thread = (verdict.category == triage.UNSORTED
+                          and existing is not None
+                          and how in (register.BY_THREAD, register.BY_NUMBER))
+        if not verdict.actionable and not on_open_thread:
             # Its .eml is never written; holding every newsletter's raw
             # MIME (attachments and all) for the rest of the check is what
             # doubled the memory a large inbox took.
             message.raw = b""
             continue
-
-        sent = sent if sent is not None else _sent_subjects(paths)
-        existing, how = register.match(rows, message, sent)
 
         # A reply on an inquiry we already know about is never a new inquiry,
         # whatever the sorter called it — otherwise a three-message

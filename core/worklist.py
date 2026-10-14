@@ -206,6 +206,31 @@ def _key(entry: dict) -> str:
                      entry.get("date", "")))
 
 
+entry_key = _key       # the public name: what remove() expects
+
+
+def remove(folder: str, kind: str, keys) -> dict:
+    """Take entries out of `kind` for good, by entry_key() — "Delete" on
+    All mail. Unknown keys change nothing."""
+    if kind not in KINDS:
+        raise ValueError(f"unknown worklist kind: {kind!r}")
+    wanted = {k for k in keys if k}
+    migrate(folder)
+    rows = [r for r in _read_kind(folder, kind) if _key(r) not in wanted]
+    _write_kind(folder, kind, rows)
+    data = load(folder)
+    data[kind] = rows
+    return data
+
+
+def clear(folder: str, kind: str) -> None:
+    """Empty one kind completely — the "start over" behind remove()."""
+    if kind not in KINDS:
+        raise ValueError(f"unknown worklist kind: {kind!r}")
+    migrate(folder)
+    _write_kind(folder, kind, [])
+
+
 def append(folder: str, kind: str, entries: list[dict]) -> dict:
     """Merge new entries into `kind`, keyed by _key() so the same message
     from two checks (the bookmark did not move, or the walk re-read it)

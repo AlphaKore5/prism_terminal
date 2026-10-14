@@ -730,6 +730,17 @@ def _clock(when) -> str:
     return when.strftime("%H:%M")
 
 
+clock = _clock      # the public name the Inquiry screen calls
+
+
+def remove(rows: list[dict], inquiry_nos) -> list[dict]:
+    """The rows left after deleting those whose Inquiry no is named
+    (case-insensitive). Unknown numbers change nothing."""
+    gone = {str(n).strip().lower() for n in inquiry_nos if n}
+    return [r for r in rows
+            if (r.get("Inquiry no") or "").strip().lower() not in gone]
+
+
 def _merge_key(row: dict):
     """What makes two rows "the same inquiry" for merge_in().
 
