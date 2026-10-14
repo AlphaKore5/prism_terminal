@@ -1575,7 +1575,7 @@ def cmd_step_ask(cfg, arg: str, attachments: list):
         ui.info("Not built. The review page stays as the record of the plan.")
         ui.ok(f"Run saved → {C.save_run(record)}")
         return
-    out_path = os.path.join(out_dir, out["modified"])
+    out_path = os.path.join(out_dir, SF.modified_name(report))
     try:
         done = SF.apply_plan(target, plan, out_path)
     except SF.StepError as e:

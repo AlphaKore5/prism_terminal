@@ -169,7 +169,26 @@ def names(report_or_stem) -> dict[str, str]:
         "xlsx_after": f"{stem} - dimensions after change.xlsx",
         "png_after":  f"{stem} - drawing sheet after change.png",
         "after_dir":  f"{stem} - after change",
+        "conversation": f"{stem} - conversation.json",
     }
+
+
+def modified_name(report_or_stem) -> str:
+    """The modified file's REAL name, stamped with when it was built.
+
+    names()['modified'] is a fixed, un-stamped base — the same literal
+    string on every Edit of the same model, in a FRESH numbered sibling
+    folder each time (output_dir()). That left the file itself with no
+    way to tell one build from another once it left its folder, or once
+    two builds' folders sat side by side: both held a file named
+    identically "<stem> - modified.step". This is what the worker that
+    actually writes the file asks for instead — never names() itself,
+    which is called more than once per build (the pre-build confirm
+    message, the actual write) and would stamp a different moment each
+    time if it carried the clock itself."""
+    stem = (report_or_stem if isinstance(report_or_stem, str)
+            else _stem(report_or_stem))
+    return f"{stem} - modified {_dt.datetime.now():%Y-%m-%d %H%M%S}.step"
 
 
 def flat_image_name(stem: str, part_name: str, index: int) -> str:
@@ -2121,7 +2140,15 @@ def _part_lines(report: dict) -> str:
 
 
 def ask_prompt(report: dict, question: str) -> str:
-    """What Groq is asked. Numbers and the question — never the model."""
+    """What the chosen model is asked — Groq, or ChatGPT/Claude/Gemini via
+    the fallback chain. Numbers and the question — never the model. The
+    format instructions are deliberately explicit (plain prose, one-line
+    lead answer, no tables, no citing reference material by name): left
+    looser, the small in-house model fell back to dense markdown tables
+    (unreadable in a plain text box) and parroted internal rule numbers at
+    the reader, where a stronger model wrote the same advice in plain,
+    readable prose without being told to. Same prompt for every model, so
+    the difference is the model, not the ask."""
     o = report["overall_mm"]
     return (
         f"You are advising a {report['mode']} moulding shop on a customer's "
@@ -2132,12 +2159,20 @@ def ask_prompt(report: dict, question: str) -> str:
         f"{len(report['parts'])} part(s)\n"
         f"{_part_lines(report)}\n\n"
         f"The customer asks: {question}\n\n"
-        "Give short, numbered, practical suggestions grounded ONLY in the "
-        "figures above — do not invent features you cannot see. Where a "
-        "suggestion is a hole size change or an overall scale change, state "
-        "it precisely: which part, current Ø, new Ø (or scale factor), and "
-        "why. Mark anything that would need the customer's designer (ribs, "
-        "draft, wall changes) as their decision, not ours."
+        "Start with ONE direct sentence that answers the question itself, "
+        "before any supporting detail. Then give short, practical "
+        "suggestions grounded ONLY in the figures above — do not invent "
+        "features you cannot see. Where a suggestion is a hole size change "
+        "or an overall scale change, state it precisely: which part, "
+        "current Ø, new Ø (or scale factor), and why. Say plainly which "
+        "ONE change matters most if the others are minor by comparison — "
+        "do not give every suggestion equal weight. Mark anything that "
+        "would need the customer's designer (ribs, draft, wall changes) as "
+        "their decision, not ours.\n\n"
+        "Write in plain paragraphs under short section headers — no "
+        "markdown tables; they do not render where this is read. Do not "
+        "cite rule numbers or name any reference material — explain the "
+        "reasoning itself, in your own words."
         + _SK.addendum("step.ask"))
 
 
@@ -2255,6 +2290,25 @@ def _scaled(shape, factor: float):
         BRepBuilderAPI_Transform(shape.wrapped, t, True).Shape())
 
 
+def _part_name_matches(ch_part: str, real_name: str) -> bool:
+    """A reviewing agent's plan names a part by typing it, not by picking
+    it off a list — and it reliably adds things the measured name never
+    had, e.g. "PET CORE 02 06" came back as "PET CORE 02 06 — 1 NOS" (a
+    quantity annotation it invented). An exact match then silently finds
+    NO part at all: predicted_parts() shows no change, and apply_plan()
+    either skips the edit or — if it was the only change in the plan —
+    raises "Nothing in the plan could be applied", with a real, specific,
+    reviewed plan never actually reaching the file. The real name as a
+    case-insensitive PREFIX of what the plan wrote is accepted instead;
+    the model's own real part names are the only things checked against,
+    so this cannot match the WRONG part, only a wordier name for the
+    right one."""
+    ch_part, real_name = ch_part.strip(), real_name.strip()
+    if ch_part == real_name:
+        return True
+    return ch_part.casefold().startswith(real_name.casefold())
+
+
 def apply_plan(path: str, plan: dict, out_path: str) -> dict:
     """Execute the validated plan on a COPY; the original file is never
     written. Returns {"out": path, "log": [human lines]}."""
@@ -2263,7 +2317,8 @@ def apply_plan(path: str, plan: dict, out_path: str) -> dict:
     log = []
     for ch in plan.get("changes") or []:
         names = ([n for n, _s in parts] if ch["part"] == "all"
-                 else [n for n, _s in parts if n == ch["part"]])
+                 else [n for n, _s in parts
+                      if _part_name_matches(ch["part"], n)])
         if not names:
             log.append(f"! no part called '{ch['part']}' — skipped")
             continue
@@ -2300,7 +2355,8 @@ def predicted_parts(report: dict, plan: dict) -> list[dict]:
     parts = copy.deepcopy(report["parts"])
     for ch in plan.get("changes") or []:
         for p in parts:
-            if ch["part"] not in ("all", p["name"]):
+            if ch["part"] != "all" and not _part_name_matches(
+                    ch["part"], p["name"]):
                 continue
             if ch["op"] == "enlarge_hole":
                 for h in p["holes"]:
@@ -2348,10 +2404,15 @@ def review_html(report: dict, plan: dict, out_dir: str,
                   " is BUILT — the After column is re-measured from the new "
                   "file, not predicted.</div>")
     else:
-        banner = ("<div class='banner'>Nothing is built yet. This page is "
-                  "the plan — go back to the terminal and answer Y to write "
-                  f"{_html.escape(names(report)['modified'])}, or N to stop "
-                  "here.</div>")
+        # No "answer Y/N here" — this page is shown from two different
+        # places (the terminal's own Y/N prompt, and the GUI's own
+        # Build/Cancel buttons next to it) and used to name only the
+        # terminal, which confused the GUI's own confirm into looking like
+        # dead instructions nothing on screen matched.
+        banner = ("<div class='banner'>Nothing is built yet. This is the "
+                  "plan for "
+                  f"{_html.escape(names(report)['modified'])} — confirm it "
+                  "to build, or stop here.</div>")
 
     def fmt(size):
         return f"{size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f}"
