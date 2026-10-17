@@ -105,6 +105,12 @@ def _remember_model(model: str, preferred: str) -> None:
     """
     if not model or model == preferred:
         return
+    if not preferred:
+        # The caller named no model (the mail check passes ""), so nothing
+        # "went missing": the chain simply started at its first entry. Saying
+        # "no longer offers the saved model" and rewriting the config on every
+        # one of a check's AI calls was noise, and a write each time.
+        return
     try:
         from . import config as C
         saved = C.load()

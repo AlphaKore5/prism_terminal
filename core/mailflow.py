@@ -590,8 +590,13 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
           knowledge: triage.Knowledge | None = None,
           model: str = "", local_only: bool = False,
           followup_days: int = 2, max_reminders: int = 3,
-          today: date | None = None) -> Result:
+          today: date | None = None, progress=None) -> Result:
     """One run of the whole loop. Never raises, never sends.
+
+    `progress(stage, done, total)`, if given, is told how far the check has
+    got — stage "fetched" (total = new mails), "sort", then "file" once per
+    mail — so a screen can say "filing 43 of 75" instead of animating blind.
+    A callback that raises is ignored: reporting never stops the work.
 
     Order of work is deliberate: fetch, sort, then act only on what sorting
     called actionable. Everything else is counted and left alone, so a busy
@@ -599,6 +604,10 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
     rather than one per message.
     """
     from . import checklog
+    # The model the owner's config has settled on, for every AI call of the
+    # check (detail reading, reply intent), not only the sorter's: left empty
+    # they each restarted the chain from its first entry.
+    model = model or cfg.get("model") or ""
     checklog.line("── Check my mail — starting ──")
     t0 = __import__("time").monotonic()
     today = today or date.today()
@@ -613,7 +622,16 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
     knowledge = knowledge or triage.Knowledge()
     out = Result(state=state or State(), knowledge=knowledge)
 
+    def tell(stage: str, done: int, total: int) -> None:
+        if progress is None:
+            return
+        try:
+            progress(stage, done, total)
+        except Exception:                               # noqa: BLE001
+            pass
+
     paths.ensure()
+    tell("fetch", 0, 0)
     messages, new_state, error = inbox.fetch_new(cfg, state)
     out.state = new_state
     if error:
@@ -621,6 +639,7 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
         out.error = error
         return out
     out.fetched = len(messages)
+    tell("sort", 0, len(messages))
 
     # cfg["model"] is where a retired default gets replaced once a fallback
     # answers — see router._remember_model. Leaving this at classify()'s own
@@ -645,7 +664,8 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
     dirty = False
     taken = None          # numbers_in_use(), read once and only when needed
     sent = None           # subjects of mails we sent, per inquiry, for matching
-    for message, verdict in zip(messages, verdicts):
+    for filed, (message, verdict) in enumerate(zip(messages, verdicts), 1):
+        tell("file", filed, len(messages))
         sent = sent if sent is not None else _sent_subjects(paths)
         existing, how = register.match(rows, message, sent)
         # A mail the sorter could not place (UNSORTED) that sits on an open
