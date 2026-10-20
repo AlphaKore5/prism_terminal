@@ -399,6 +399,9 @@ _PROFILES: dict[str, dict] = {
         "avoid": "",
     },
     "LAZYCOOK": {"produces": ("text",), "file_hint": "", "avoid": ""},
+    "Grok": {"produces": ("text",), "file_hint": "", "avoid": ""},
+    "DeepSeek": {"produces": ("text",), "file_hint": "", "avoid": ""},
+    "Gemini": {"produces": ("text",), "file_hint": "", "avoid": ""},
     "Kimi 2.6": {
         "produces": ("text", "file", "data"),
         "file_hint": "",
@@ -605,6 +608,103 @@ AGENT_REGISTRY = {
         response_selector=(".font-claude-message, .font-claude-response, "
                            ".prose, [data-is-streaming='false']"),
         submit_selector="button[aria-label='Send Message']",
+    ),
+    # Read live on 20 Oct 2026 by attaching Claude in Chrome to the owner's
+    # own signed-in grok.com (same pattern as Google Gemini's note below):
+    # asked "What is 2+2?" then a 300-word bridge-engineering question to
+    # catch the busy state mid-stream. The composer is a tiptap/ProseMirror
+    # contenteditable, same framework ChatGPT uses, but grok.com tags its
+    # own turns and controls with data-testid rather than leaning on classes
+    # or ARIA alone — [data-testid="assistant-message"] held the answer text
+    # ONLY, the per-turn toolbar (Copy/Like/Dislike/Regenerate) sits beside
+    # it as a sibling, not nested inside, so response_selector never picks
+    # up a button's own label text. First use: a one-time, non-dismissible
+    # age-confirmation modal blocked the very first send on this account —
+    # not part of the chat DOM itself, so no selector here handles it; it
+    # does not reappear once answered.
+    "Grok": _agent(
+        "https://grok.com",
+        "general-purpose reasoning and drafting with real-time awareness "
+        "via X (Twitter); a fast, free-tier-friendly alternative when "
+        "ChatGPT or Claude are rate-limited or unavailable",
+        "Freemium", "5–15s", 120,
+        textarea_selector="div[contenteditable='true'][aria-label='Ask Grok anything']",
+        response_selector="[data-testid='assistant-message']",
+        submit_selector="button[data-testid='chat-submit']",
+        busy_selector="button[aria-label='Stop model response']",
+        regenerate_selector="button[aria-label='Regenerate']",
+    ),
+    # Read live on 20 Oct 2026, same session and method as Grok above, once
+    # the owner had signed into chat.deepseek.com themselves (an account
+    # login is one thing this assistant will never do on someone's behalf,
+    # so Grok's research had to stop at the sign-in wall until this). No
+    # data-testid attributes anywhere on this app, unlike grok.com — its own
+    # design-system class names (ds-button, ds-markdown, …) are the stable
+    # thing instead, so those are what the three selectors below key off.
+    # Two things this did NOT come away with, stated rather than guessed at:
+    #   - busy_selector: the one circular send button toggles state, but
+    #     NOT in any way distinguishable by class or by its SVG content —
+    #     it reads ds-button--disabled whether the box is simply empty OR a
+    #     reply is actively streaming (checked repeatedly, incl. with "Deep
+    #     thinking" on for a long reasoning answer to widen the window).
+    #     Left unset; _GENERIC has no default for it either, so this falls
+    #     back to the engine's own text-stopped-growing polling, same as
+    #     Perplexity, Kimi 2.6 and most of this file already do.
+    #   - regenerate_selector: no distinct regenerate affordance was found
+    #     near a finished answer in the time spent looking. Left unset.
+    # A second, DIFFERENT element also matches ".ds-button--circle" once a
+    # conversation is tall enough to need one — a floating "scroll to the
+    # newest message" control that sits ABOVE the composer, not inside it.
+    # submit_selector excludes it explicitly (:not(.ds-button--floating)):
+    # without that, a long conversation would start clicking a scroll
+    # button instead of ever sending the next message.
+    "DeepSeek": _agent(
+        "https://chat.deepseek.com",
+        "a large, free-tier-friendly reasoning model (optional 'Deep "
+        "thinking' mode) with its own web search ('Smart Search'); a "
+        "capable alternative when ChatGPT or Claude are unavailable",
+        "Freemium", "10–30s", 180,
+        textarea_selector="textarea[placeholder='Message DeepSeek']",
+        response_selector=".ds-markdown",
+        submit_selector="div.ds-button--circle:not(.ds-button--floating)",
+    ),
+    # A SEPARATE entry from "Google Gemini" above on purpose, the same way
+    # "Claude" and "Claude Design" are two entries for one company's two
+    # different jobs. "Google Gemini" is permanently tagged in _MAKES as an
+    # image maker ("Google Gemini": "generated images") — that tag is
+    # applied to AGENT_REGISTRY["Google Gemini"] by name, unconditionally,
+    # at the bottom of this file (the "for _name, _what in _MAKES.items()"
+    # loop), so every stage that entry is EVER assigned to gets an
+    # image-generation brief, not a "write this document" one. Reusing it
+    # for a BOQ write-up would have asked the writer stage to draw a
+    # picture of a bill of quantities. This entry points at the exact same
+    # product (gemini.google.com) for the TEXT side of it instead, with no
+    # "makes" tag, so a stage assigned here gets an ordinary text brief.
+    #
+    # Read live on 20 Oct 2026, same session/method as Grok and DeepSeek
+    # above: "Write a short 3-sentence summary of a bill of quantities for
+    # a brick wall measuring 12 meters", then a 300-word bridge-engineering
+    # question to catch the busy state. Gemini's composer is a Quill.js
+    # editor (class="ql-editor", the same library many unrelated sites
+    # use) inside a <rich-textarea> custom element — the aria-label is what
+    # actually identifies it, not the Quill class, which is generic.
+    # Answers render inside Gemini's own <message-content> custom element,
+    # confirmed to hold the answer text ONLY (not the Copy/Edit/Good
+    # response toolbar below it). No regenerate_selector: a "Show more
+    # options" menu might hold one, but opening and reading a dropdown
+    # wasn't tried this pass -- left unset rather than guessed, same
+    # reasoning as DeepSeek's gaps above.
+    "Gemini": _agent(
+        "https://gemini.google.com/app",
+        "Google's general-purpose assistant for text and reasoning (not "
+        "the image generator — see 'Google Gemini' for that); broad web "
+        "knowledge and a large context window, useful when ChatGPT or "
+        "Claude are unavailable or rate-limited",
+        "Freemium", "10–20s", 120,
+        textarea_selector="div[contenteditable='true'][aria-label='Enter a prompt for Gemini']",
+        response_selector="message-content",
+        submit_selector="button[aria-label='Send message']",
+        busy_selector="button[aria-label='Stop response']",
     ),
     # LAZYCOOK runs its own Generate → Analyze → Optimize → Validate loop and
     # does its own web scraping. That loop is the entire reason to route work

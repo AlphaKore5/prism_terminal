@@ -175,8 +175,14 @@ def for_stage(stage: str, planner_kind: str = "",
 
 
 #: Steps that WRITE, and so can be the one that hands back a requested file.
+# "recheck" and "followup" are /boq's own labels for its verify-and-remake
+# and plain follow-up stages (not in _BY_STAGE, so they default to "text")
+# — added so a follow-up that asks for ".docx"/"as a file" in its own words,
+# or through /boq's format picker, can be promoted to a `file` step the same
+# way a fresh write-up already can, instead of only ever landing as chat
+# text no matter what the person asked for.
 _WRITING_STAGES = ("content", "brains", "summary", "development", "research",
-                   "write", "format")
+                   "write", "format", "recheck", "followup")
 
 
 def file_step_index(entries, query: str) -> int:
