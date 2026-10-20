@@ -2142,13 +2142,14 @@ def _part_lines(report: dict) -> str:
 def ask_prompt(report: dict, question: str) -> str:
     """What the chosen model is asked — Groq, or ChatGPT/Claude/Gemini via
     the fallback chain. Numbers and the question — never the model. The
-    format instructions are deliberately explicit (plain prose, one-line
-    lead answer, no tables, no citing reference material by name): left
-    looser, the small in-house model fell back to dense markdown tables
-    (unreadable in a plain text box) and parroted internal rule numbers at
-    the reader, where a stronger model wrote the same advice in plain,
-    readable prose without being told to. Same prompt for every model, so
-    the difference is the model, not the ask."""
+    answer now renders as real Markdown (headers, bold, lists and tables
+    all render — see addons/step/workbench.py's _Markdown), so the format
+    instructions ask for that structure directly: a short header per
+    section, bold on the one change that matters, a real list instead of
+    one run-on paragraph. Earlier this told every model to write plain
+    prose with no markdown, because the chat box back then printed pipes
+    and hashes literally — that box is gone. Same prompt for every model,
+    so the difference is the model, not the ask."""
     o = report["overall_mm"]
     return (
         f"You are advising a {report['mode']} moulding shop on a customer's "
@@ -2169,10 +2170,15 @@ def ask_prompt(report: dict, question: str) -> str:
         "do not give every suggestion equal weight. Mark anything that "
         "would need the customer's designer (ribs, draft, wall changes) as "
         "their decision, not ours.\n\n"
-        "Write in plain paragraphs under short section headers — no "
-        "markdown tables; they do not render where this is read. Do not "
-        "cite rule numbers or name any reference material — explain the "
-        "reasoning itself, in your own words."
+        "Write it as Markdown: a short ## header for each section (for "
+        "example Verdict, What holds up, What's wrong), **bold** for the "
+        "one change that matters most and for key figures, and a numbered "
+        "or bulleted list for multiple points — one blank line between "
+        "list items so they render as a real list, not one run-on "
+        "paragraph. A table is fine for a handful of before/after "
+        "numbers; skip it otherwise. Do not cite rule numbers or name "
+        "any reference material — explain the reasoning itself, in your "
+        "own words."
         + _SK.addendum("step.ask"))
 
 
