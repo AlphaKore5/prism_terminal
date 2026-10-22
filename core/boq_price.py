@@ -48,6 +48,13 @@ try:                                                    # pragma: no cover
 except Exception:                                       # pragma: no cover
     HAVE_XLSX = False
 
+try:                                                    # pragma: no cover
+    import docx
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    HAVE_DOCX = True
+except Exception:                                       # pragma: no cover
+    HAVE_DOCX = False
+
 
 # ── units ────────────────────────────────────────────────────────────────────
 # core.boq reports lengths/areas in the drawing's own unit word ("meters",
@@ -655,6 +662,110 @@ def write_boq_csv(boq: Boq, path: str) -> str:
                     f"GST {_pct(boq.gst_pct)}%", f"{boq.gst_amount():.2f}"])
         w.writerow(["", "", "", "", "", "", "Grand total",
                     f"{boq.grand_total():.2f}"])
+    return path
+
+
+# ── the deliverable, part one-and-a-half: a tender-ready Word document ─────────
+# The owner's own words: "BOQ in any format gets filled in with the number
+# from the pricing list the user will attach, that's it" — xlsx/csv/pdf
+# already did; Word did not. Same Boq, same Decimal arithmetic the other
+# three writers use (subtotal()/contingency_amount()/pre_tax_total()/
+# gst_amount()/grand_total()) -- nothing here decides a rate or an amount,
+# the same promise core/boq_price.py's own module docstring makes "without
+# exception". Word has no formula cells, so unlike the xlsx sheet this is a
+# flat, once-computed table -- editing a rate here does not re-flow the
+# totals the way it does in Excel; the Excel export is still what an
+# estimator should open to adjust and recalculate.
+
+def write_boq_docx(boq: Boq, path: str) -> str:
+    """Write `boq` to a tender-ready .docx and return `path`."""
+    if not HAVE_DOCX:
+        raise BoqError("Writing a Word BOQ needs the python-docx package.")
+
+    doc = docx.Document()
+    heading = doc.add_heading(boq.title.upper(), level=1)
+    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta_pairs = [("Project", boq.project), ("Client", boq.client),
+                  ("Location", boq.location), ("Date", boq.date),
+                  ("Revision", boq.revision)]
+    meta = "   ·   ".join(f"{k}: {v}" for k, v in meta_pairs if v)
+    if meta:
+        p = doc.add_paragraph(meta)
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    table = doc.add_table(rows=1, cols=6)
+    table.style = "Table Grid"
+    for cell, name in zip(table.rows[0].cells, _COLS):
+        cell.text = name
+        if cell.paragraphs[0].runs:
+            cell.paragraphs[0].runs[0].font.bold = True
+
+    def add_row(values, *, bold=False):
+        cells = table.add_row().cells
+        for cell, value in zip(cells, values):
+            cell.text = str(value)
+            if bold and cell.paragraphs[0].runs:
+                cell.paragraphs[0].runs[0].font.bold = True
+        return cells
+
+    for section, items in boq.sections():
+        header = table.add_row().cells
+        header[0].merge(header[-1])
+        header[0].text = section
+        if header[0].paragraphs[0].runs:
+            header[0].paragraphs[0].runs[0].font.bold = True
+        for n, it in enumerate(items, 1):
+            desc = it.description + (f"  [{it.code}]" if it.code else "")
+            if it.is_derived:
+                desc += "  (estimated — verify)"
+            add_row([n, desc, it.unit, _qty_str(it.quantity),
+                    (_inr(it.rate) if it.priced else ""), _inr(it.amount)])
+        section_total = sum((it.amount for it in items), Decimal(0))
+        add_row(["", f"Sub-total — {section}", "", "", "", _inr(section_total)],
+                bold=True)
+
+    add_row(["", "Sub-total (all works)", "", "", "", _inr(boq.subtotal())],
+            bold=True)
+    add_row(["", f"Add: Contingency @ {_pct(boq.contingency_pct)}%", "", "", "",
+            _inr(boq.contingency_amount())], bold=True)
+    add_row(["", "Total before GST", "", "", "", _inr(boq.pre_tax_total())],
+            bold=True)
+    if boq.interstate:
+        add_row(["", f"Add: IGST @ {_pct(boq.gst_pct)}%", "", "", "",
+                _inr(boq.gst_amount())], bold=True)
+    else:
+        # cgst/sgst split for display only, same arithmetic boq_html()
+        # already uses -- sgst is gst_amount() minus cgst, not computed
+        # independently, so the two halves always sum to the exact total.
+        half_pct = quoting.to_decimal(boq.gst_pct) / 2
+        cgst = quoting.rupees(boq.pre_tax_total() * half_pct / 100)
+        sgst = boq.gst_amount() - cgst
+        add_row(["", f"Add: CGST @ {_pct(half_pct)}%", "", "", "", _inr(cgst)],
+                bold=True)
+        add_row(["", f"Add: SGST @ {_pct(half_pct)}%", "", "", "", _inr(sgst)],
+                bold=True)
+    add_row(["", "GRAND TOTAL", "", "", "", _inr(boq.grand_total())], bold=True)
+
+    words = doc.add_paragraph(amount_in_words(boq.grand_total()))
+    if words.runs:
+        words.runs[0].font.bold = True
+        words.runs[0].font.italic = True
+
+    notes = list(boq.notes)
+    unpriced = boq.unpriced()
+    if unpriced:
+        notes.insert(0, f"⚠ {len(unpriced)} item(s) have NO rate yet — fill "
+                     "every rate before this BOQ is tendered.")
+    notes.append("Quantities are measured from the drawing geometry; rates "
+                 "are to be verified against your quotation or the "
+                 "applicable DSR / state SOR. This Word copy is a snapshot — "
+                 "edit a rate and re-export rather than typing over a total.")
+    for note in notes:
+        doc.add_paragraph(note)
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    doc.save(path)
     return path
 
 

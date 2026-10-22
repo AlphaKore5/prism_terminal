@@ -14,6 +14,11 @@ data afterward, to write it up as a professionally formatted BOQ document
 (item numbers, descriptions, grouping by trade) — formatting is exactly what
 it's good at; measuring is exactly what it isn't.
 
+Real drawings keep teaching this module conventions it didn't know about —
+read HVAC_DRAWING_RULES.md (same folder) before changing anything that
+walks LINE/LWPOLYLINE/POLYLINE geometry, and add to it, in its own shape,
+the next time a real client file finds another one.
+
 .dwg is a proprietary binary format ezdxf cannot read directly. It must be
 converted to .dxf (an open, documented format) FIRST, on the user's own
 machine, with one of:
@@ -513,9 +518,104 @@ def _hatch_area(e) -> float:
     return abs(total)
 
 
+# ── double-line ductwork/pipework ───────────────────────────────────────────
+# HVAC_DRAWING_RULES.md rule 1, found 22 Oct 2026 on a real HVAC test file: a
+# duct (also a pipe, a cable tray — anything with real width worth drawing to
+# scale) is very often drawn as its TWO EDGES, not one centreline, in ordinary
+# professional CAD practice. Counting every LINE on the layer, oblivious to
+# this, silently double-counted a run's length — summed BOTH edges as if they
+# were two separate runs. Caught comparing Prism's own 78.82 m against an
+# AI's own direct read of the same drawing, 38.80 m: a client's real file, not
+# a corner case built to test with.
+
+def _collapse_duct_pairs(segments: list) -> tuple[float, int]:
+    """The route length of one layer's straight LINE segments, treating a
+    matched pair of near-parallel, near-equal-length lines a small constant
+    distance apart as ONE run (its two edges), not two — and dropping the
+    short perpendicular stub that closes the open end of a paired run, which
+    is not route length at all, just the drawing closing the rectangle.
+
+    A line with no match is kept at its own full, un-halved length — this
+    only ever acts on a genuine double-line pair; an ordinary single-line
+    (centreline/schematic) run, on its own layer, is untouched. Two SEPARATE
+    same-length parallel runs (e.g. a flow pipe and a return pipe) are safe
+    by construction as long as the drawing keeps them on separate layers,
+    which is the normal convention this whole module already relies on
+    elsewhere — this function only ever compares lines within ONE layer's
+    own list, never across layers.
+
+    Returns (total_length, pairs_found) — the caller turns a non-zero
+    `pairs_found` into a visible note, never a silent correction: this is a
+    geometric inference, not a measurement, and the module's whole promise
+    is that nothing here is silently trusted."""
+    n = len(segments)
+    lengths = [_dist(a, b) for a, b in segments]
+    dirs = []
+    for (a, b), length in zip(segments, lengths):
+        if length <= 0:
+            dirs.append((0.0, 0.0))
+            continue
+        dirs.append(((b[0] - a[0]) / length, (b[1] - a[1]) / length))
+
+    used = [False] * n
+    pairs: list[tuple[int, int, float]] = []
+    for i in range(n):
+        if used[i] or lengths[i] <= 0:
+            continue
+        best = None
+        for j in range(i + 1, n):
+            if used[j] or lengths[j] <= 0:
+                continue
+            # roughly parallel, either sense (cross product of unit vectors)
+            cross = abs(dirs[i][0] * dirs[j][1] - dirs[i][1] * dirs[j][0])
+            if cross > 0.05:
+                continue
+            # roughly the same length -- the two edges of one run
+            if abs(lengths[i] - lengths[j]) > 0.08 * max(lengths[i], lengths[j]):
+                continue
+            # a small, constant perpendicular offset: the run's own width,
+            # not an unrelated line that merely happens to run alongside it.
+            # 0.5 (not a looser ratio) is deliberate: a real room's opposite
+            # walls can be a similar length and a similar distance apart too
+            # (caught live -- a 24 m / 14 m room scored 0.58 and was nearly
+            # read as one 24 m duct) -- a genuine duct/pipe/tray run is a
+            # thin strip, never close to as wide as it is long.
+            nrm = (-dirs[i][1], dirs[i][0])
+            off = abs((segments[j][0][0] - segments[i][0][0]) * nrm[0]
+                      + (segments[j][0][1] - segments[i][0][1]) * nrm[1])
+            if not (1.0 < off < 0.5 * max(lengths[i], lengths[j])):
+                continue
+            if best is None or off < best[1]:
+                best = (j, off)
+        if best:
+            j, off = best
+            used[i] = used[j] = True
+            pairs.append((i, j, off))
+
+    total = sum((lengths[i] + lengths[j]) / 2 for i, j, _off in pairs)
+
+    for k in range(n):
+        if used[k] or lengths[k] <= 0:
+            continue
+        is_cap = False
+        for i, _j, off in pairs:
+            # roughly perpendicular to that pair's own direction, and about
+            # as long as that pair's offset -- the stub closing its open end
+            cross = abs(dirs[k][0] * dirs[i][1] - dirs[k][1] * dirs[i][0])
+            if cross > 0.8 and abs(lengths[k] - off) < 0.25 * max(off, 1.0):
+                is_cap = True
+                break
+        if is_cap:
+            used[k] = True
+            continue
+        total += lengths[k]
+
+    return total, len(pairs)
+
+
 # ── measurement ────────────────────────────────────────────────────────────
 
-def measure(dxf_path: str) -> dict:
+def measure(dxf_path: str, hvac: bool = False) -> dict:
     """Walk every entity in every layout's modelspace-equivalent geometry and
     return real, measured quantities — never estimated, never AI-guessed:
 
@@ -524,6 +624,15 @@ def measure(dxf_path: str) -> dict:
          "areas_by_layer":   {"ROOM-HATCH": 88.4, ...},
          "block_counts":     {"DOOR-900": 12, "WINDOW-1200": 8, ...},
          "layers": ["0", "WALLS", ...], "entity_count": 431}
+
+    `hvac=True` additionally applies HVAC_DRAWING_RULES.md's rules (today:
+    rule 1, _collapse_duct_pairs) — gated deliberately, the owner's own
+    instruction (22 Oct 2026): these rules are trade-specific, verified
+    against HVAC drawings specifically, and must not quietly start
+    reading an electrical or plumbing drawing's lines differently just
+    because they happen to look paired. The caller decides `hvac` from
+    whether the person's own request actually says "HVAC" — see
+    addons/boq/dialog.py:_measure().
     """
     doc, read_notes = _read_dxf(dxf_path)
 
@@ -536,6 +645,12 @@ def measure(dxf_path: str) -> dict:
     block_layers: dict[str, set] = {}
     seen_layers: set[str] = set()
     entity_count = 0
+    # Raw LINE endpoints per layer, held back from `lengths` until every
+    # LINE on that layer is in hand -- a double-line duct/pipe/tray run
+    # (_collapse_duct_pairs) can only be told apart from a genuine single
+    # line by comparing it against its layer's OTHER lines, never one at a
+    # time as each is read off the drawing.
+    line_segments: dict[str, list] = {}
     # For the site facts (_site_facts): where each block sits and at what
     # scale, and each layer's extent, piece count and whether it closes.
     block_pos: dict[str, list] = {}
@@ -567,7 +682,7 @@ def measure(dxf_path: str) -> dict:
         try:
             if t == "LINE":
                 a, b = (e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)
-                add(lengths, layer, _dist(a, b))
+                line_segments.setdefault(layer, []).append((a, b))
                 extend(layer, (a, b), False)
             elif t == "LWPOLYLINE":
                 add(lengths, layer, _lwpolyline_length(e))
@@ -602,6 +717,22 @@ def measure(dxf_path: str) -> dict:
             # One malformed entity (a stray null vertex, a degenerate arc)
             # must not sink the whole takeoff — skip it, keep going.
             continue
+
+    for layer, segments in line_segments.items():
+        if hvac:
+            total, pair_count = _collapse_duct_pairs(segments)
+        else:
+            # The plain, original sum -- every other trade's drawings keep
+            # measuring exactly as they always did; HVAC_DRAWING_RULES.md's
+            # rules only ever apply when `hvac` says so.
+            total = sum(_dist(a, b) for a, b in segments)
+            pair_count = 0
+        add(lengths, layer, total)
+        if pair_count:
+            read_notes.append(
+                f"{layer}: read {pair_count} pair(s) of lines as one run's "
+                "two edges, not two separate runs (a duct/pipe/tray drawn "
+                "to its real width) — verify before pricing.")
 
     try:
         site = _site_facts(unit_code, lengths, layer_geom, block_pos, block_scales)
@@ -828,6 +959,12 @@ def write_quantities_csv(q: dict, path: str) -> None:
             w.writerow(["area", layer, f"{area:.2f}", f"square {q['unit']}"])
         for name, count in q["block_counts"].items():
             w.writerow(["count", name, count, "nos"])
+        # A rule (HVAC_DRAWING_RULES.md rule 1, today) inferred rather than
+        # purely measured a number -- stays in the file this re-opens as,
+        # not only the live app's own screen, so it survives being emailed
+        # or filed away.
+        for text in (q.get("notes") or []):
+            w.writerow(["note", "", text, ""])
 
 
 def summary_text(q: dict) -> str:
