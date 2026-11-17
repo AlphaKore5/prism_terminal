@@ -160,6 +160,19 @@ CATEGORIES = {
 }
 
 
+def prune_for_server() -> None:
+    """Server mode: stop offering tools and categories Prism's plan does not
+    include (Canva, Midjourney, voice, decks, ...). Only the pickable lists
+    change; AGENT_REGISTRY and PIPELINE_ORDER stay, so an old saved plan that
+    still names one is skipped at run time with a plain message. Idempotent."""
+    from .server_session import _NO_SERVER_EQUIVALENT, _NO_SERVER_STAGES
+    for stage in _NO_SERVER_STAGES:
+        CATEGORIES.pop(stage, None)
+    for meta in CATEGORIES.values():
+        meta["agents"] = [n for n in meta["agents"]
+                          if n not in _NO_SERVER_EQUIVALENT]
+
+
 # The "summary" stage is not user-selectable; it reuses whichever agent the
 # user picked for "brains" (falling back to content / research).
 SUMMARY_FALLBACK_ORDER = ["brains", "content", "research"]
