@@ -118,20 +118,22 @@ def probe_video(path: str, fps: int = SAMPLE_FPS) -> dict[str, Any] | None:
     """The rhythm profile of a finished video FILE — a Motion film, a Studio reel,
     a Reel, a reference — with FFmpeg only, no browser. Same maths, same
     thresholds. None when FFmpeg cannot read it."""
-    import json as _json
+    import re
     import subprocess
     import numpy as np
     from .. import ffmpeg
     ff = ffmpeg.locate()
     if not ff or not os.path.exists(path):
         return None
-    ffprobe = os.path.join(os.path.dirname(ff), "ffprobe")
+    # The size comes from FFmpeg's own banner, not ffprobe: the copy Prism ships
+    # (imageio-ffmpeg) has no ffprobe next to it, and customers' machines do not
+    # have one on PATH either, so asking ffprobe made this return None for
+    # everyone except developers who happened to have it installed.
     try:
-        j = _json.loads(subprocess.run(
-            [ffprobe if os.path.exists(ffprobe) else "ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height", "-of", "json", path],
-            capture_output=True, text=True).stdout)["streams"][0]
-        w0, h0 = int(j["width"]), int(j["height"])
+        banner = subprocess.run([ff, "-hide_banner", "-i", path], capture_output=True, text=True,
+                                errors="replace").stderr
+        m = re.search(r"Video:.*?[,\s](\d{2,5})x(\d{2,5})[,\s\[]", banner)
+        w0, h0 = int(m.group(1)), int(m.group(2))
     except Exception:  # noqa: BLE001
         return None
     w = ANALYSIS_WIDTH
