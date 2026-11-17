@@ -370,6 +370,10 @@ def document_from_text(text: str, out_dir: str, stem: str,
     text = (text or "").strip()
     if not text or not can_write(ext):
         return "", ""
+    # A spreadsheet is only made when the answer holds a real table; building
+    # one from prose would be a worse deliverable than an honest "not produced".
+    if ext == ".xlsx" and not re.search(r"^\s*\|.+\|\s*$", text, re.M):
+        return "", ""
     os.makedirs(out_dir, exist_ok=True)
     # A real PDF is drawn by Qt's own text engine (no extra library, works in
     # the frozen app). Only when that is unavailable (the terminal CLI without
