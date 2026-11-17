@@ -1192,6 +1192,11 @@ def alternatives_for(stage: str, tried: list | tuple = (),
     request this signal exists to keep away from Canva in the first
     place.
     """
+    from . import ai_client
+    if ai_client.active():
+        # Server mode has no other websites to hand a failed step to; a
+        # retry here would only spend the customer's credits again.
+        return []
     seen = {t for t in tried if t}
     if stage in ("visual", "presentation") and not wants_canva(query):
         seen.add("Canva")

@@ -21,6 +21,34 @@ import webbrowser
 from . import agents as A
 from . import config as C
 from . import ui
+from . import ai_client as _ai
+from . import server_session as _SS
+
+def _server_aware(neutral):
+    """In server mode `driver` is a ServerSession, not a browser. A helper that
+    would have touched the page answers `neutral` instead: a value, or a
+    function of (driver, *args, **kwargs). See core/server_session.py."""
+    import functools
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(driver, *a, **k):
+            if _SS.is_session(driver):
+                return neutral(driver, *a, **k) if callable(neutral) else neutral
+            return fn(driver, *a, **k)
+        return wrapper
+    return deco
+
+
+def _ss_reask(driver, agent_cfg, prompt, expect="", wait=0, should_stop=None):
+    try:
+        return [driver.send(prompt)]
+    except _ai.AiError as e:
+        driver.last_error = _ai.plain(e)
+        ui.warn(f"   {driver.last_error}")
+        return []
+
+
 
 def _chrome_binaries() -> list[str]:
     """Where Chrome might be, on this machine specifically.
@@ -1418,6 +1446,7 @@ return hits.length;
 """
 
 
+@_server_aware(0)
 def _clear_staged_attachments(driver, agent_cfg, agent_name: str = "") -> int:
     """Take off whatever the composer already holds before this stage's own
     files go up. Returns how many chips were removed (-1: no composer found).
@@ -1614,6 +1643,7 @@ def _verify_page_attachments(driver, basenames: list[str], timeout: float = 6.0)
     return count, matched, err
 
 
+@_server_aware(lambda d, agent_cfg, atts, agent_name='': d.add_files(atts))
 def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
     """Push any attached files into the tool's <input type='file'>, if present.
 
@@ -2003,6 +2033,7 @@ def _within(selector_list: str, descendant: str) -> str:
     return ", ".join(f"{p.strip()} {descendant}" for p in parts if p.strip())
 
 
+@_server_aware([])
 def _harvest_images(driver, agent_cfg, stage: str,
                     exclude_files: list | None = None) -> list[dict]:
     """A generated image can't travel in a text handoff. Pull every real image
@@ -2363,6 +2394,7 @@ def _safe_filename(name: str) -> str:
     return name[:120]
 
 
+@_server_aware([])
 def _harvest_files(driver, agent_cfg, stage: str, ignore_names=(),
                    click_fallback: bool = True) -> list[dict]:
     """Non-image sibling of _harvest_images. A code, presentation or format
@@ -2625,6 +2657,7 @@ _FILE_HINT_RE = re.compile(
                               for ext in _HARVESTABLE_EXTS) + r")\b", re.I)
 
 
+@_server_aware([])
 def _harvest_stage_files(driver, agent_cfg, stage: str, texts,
                          attachments=None) -> list[dict]:
     """Every file a stage produced, on ANY stage.
@@ -2730,6 +2763,8 @@ def _meet_contract(driver, agent_cfg: dict, stage: str, kind: str,
 
     ext = _c.wanted_ext(query)
     ask = _c.reask(kind, ext=ext, query=query, task=task)
+    if _SS.is_session(driver):
+        ask = ""        # a server chat cannot attach a file; write it ourselves below
     halted = should_stop or (lambda: False)
     if (ask and driver is not None and agent_cfg.get("textarea_selector")
             and not halted()):
@@ -2989,6 +3024,7 @@ def _click_download_control(driver, agent_cfg: dict) -> bool:
     return _click_by_text(driver, ["download"], timeout=4)
 
 
+@_server_aware(False)
 def _current_chatgpt_file_card(driver) -> bool:
     """Whether the newest ChatGPT reply already contains a generated file.
 
@@ -3221,6 +3257,7 @@ def _is_prompt_echo(text: str) -> bool:
     return sum(m in low for m in _PROMPT_ECHO_SOFT) >= 2
 
 
+@_server_aware('')
 def _safe_url(driver, exclude=()) -> str:
     """The current tab's URL, for the paths where the stage blew up. Never
     raises (the session itself may be what died) and never returns a link that
@@ -3254,6 +3291,7 @@ def _sleep_interruptibly(seconds: float, should_stop=None) -> bool:
     return should_stop()
 
 
+@_server_aware((0, True))
 def _smart_wait(driver, agent_cfg, cap: int, poll: int = 1,
                 stable_for: float = 2.5, min_wait: int = 3,
                 expect: str = "", should_stop=None) -> tuple[int, bool]:
@@ -3409,6 +3447,7 @@ EMPTY_TURN_AFTER = 20
 EMPTY_TURN_PATIENCE = 15
 
 
+@_server_aware(False)
 def _regenerate_once(driver, agent_cfg: dict) -> bool:
     """Press the tool's own "regenerate" on an empty answer, once.
 
@@ -3443,6 +3482,7 @@ def _regenerate_once(driver, agent_cfg: dict) -> bool:
     return clicked
 
 
+@_server_aware(0)
 def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
                      grace: int | None = None, should_stop=None,
                      baseline_count: int | None = None) -> int:
@@ -3587,6 +3627,7 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
     return last
 
 
+@_server_aware(False)
 def _chatgpt_is_busy(driver) -> bool:
     """True if ChatGPT is actively generating an image or answer."""
     try:
@@ -3600,6 +3641,7 @@ def _chatgpt_is_busy(driver) -> bool:
         return False
 
 
+@_server_aware(0)
 def _wait_for_files(driver, cap: int = 60, grace: int = 12,
                     stage: str = "") -> int:
     """_wait_for_images's twin for document/deck/code deliverables.
@@ -5211,6 +5253,7 @@ _EXHAUSTED_MARKERS = (
 )
 
 
+@_server_aware('')
 def _looks_exhausted(driver) -> str:
     """"" if the tool is fine, else why it cannot answer right now.
 
@@ -5240,6 +5283,7 @@ def _looks_exhausted(driver) -> str:
     return ""
 
 
+@_server_aware('')
 def _looks_signed_out(driver) -> str:
     """"" if the page looks usable, else what the user has to do about it.
 
@@ -5270,6 +5314,7 @@ def _looks_signed_out(driver) -> str:
     return ""
 
 
+@_server_aware('')
 def _looks_unreadable(driver, questions, timed_out: bool = False) -> str:
     """"" unless the page holds a real conversation we could not read.
 
@@ -5342,6 +5387,7 @@ def _clean_capture(text: str) -> str:
     return t.strip()
 
 
+@_server_aware(lambda d, agent_cfg, keep='': list(d.captures))
 def _capture(driver, agent_cfg: dict, keep: str = "") -> list[str]:
     """Everything on the page that reads as a reply, longest captures only.
 
@@ -5407,6 +5453,7 @@ def _capture(driver, agent_cfg: dict, keep: str = "") -> list[str]:
 _EDITABLE_STAGES = ("visual", "presentation")
 
 
+@_server_aware(lambda d, agent_cfg, stage, query, stage_responses, **k: (stage_responses, ''))
 def _make_editable(driver, agent_cfg: dict, stage: str, query: str,
                    responses: list,
                    machine_shaped: bool = False,
@@ -5541,6 +5588,7 @@ def _design_turn_text(driver, agent_cfg: dict, texts: list, web, ask) -> str:
     return texts[-1] if texts else got
 
 
+@_server_aware(_ss_reask)
 def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "",
            wait: int = 0, should_stop=None) -> list[str]:
     """Send one follow-up in the SAME tab and re-scrape.
@@ -5678,7 +5726,10 @@ def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
         # way the imagery stage's are, then adopted into the reel's artwork.
         maker = (cfg.get("agents") or {}).get("visual") or "ChatGPT"
         maker_cfg = A.resolve_agent("visual", maker)
-        if not maker_cfg:
+        if _ai.active():
+            ui.warn("   " + _SS.not_in_plan("Making new pictures inside a "
+                    "follow-up") + " Going on without.")
+        elif not maker_cfg:
             ui.warn(f"   {maker} can't make pictures here — going on without")
         else:
             emit("stage_start", {"stage": "artwork", "agent": maker})
@@ -5783,10 +5834,16 @@ def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
     ui.rule(f"DESIGN  ·  {agent_name}  ·  follow-up",
             style=A.CATEGORIES.get("design", {}).get("color", "pink"))
     if driver is None:
-        driver, _ = _get_driver(cfg)
-    _open_tab(driver, agent_name)
-    driver.get(design_url)
-    _time.sleep(agent_cfg.get("page_wait", 4))
+        if _ai.active():
+            driver = _SS.ServerSession()
+        else:
+            driver, _ = _get_driver(cfg)
+    if _SS.is_session(driver):
+        driver.begin("design", agent_name, "code")
+    else:
+        _open_tab(driver, agent_name)
+        driver.get(design_url)
+        _time.sleep(agent_cfg.get("page_wait", 4))
     wait = followup_wait(agent_cfg)
 
     # Upload newly generated/attached artwork to the reopened design conversation
@@ -7280,7 +7337,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         C.continue_run(cur_dir, task=query, title=run_title)
     else:
         C.begin_run(query, title=run_title)
-    driver, fresh = _get_driver(cfg)
+    if _ai.active():
+        # Server mode: no Chrome, ever. Every AI step is a call through
+        # Prism's server (core/server_session.py).
+        driver, fresh = _SS.ServerSession(), True
+    else:
+        driver, fresh = _get_driver(cfg)
     all_responses: dict[str, list[str]] = {
         k: list(v) if isinstance(v, list) else [str(v)]
         for k, v in (prior_responses or {}).items()
@@ -7570,6 +7632,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         a transient browser failure from cancelling the whole client reel.
         """
         nonlocal driver, first_tab
+        if _SS.is_session(driver):
+            driver.begin(stage, agent_name, _SS.role_for(
+                stage, agent_name,
+                feeder=(stage_idx in (design_feeder, motion_feeder, spec_feeder))))
+            return
         target = agent_cfg["url"]
         res_cand = (resume_urls or {}).get(stage)
         if res_cand:
@@ -7701,6 +7768,22 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                           "this step was left out. Pick a different tool for "
                           "it in the plan."})
             continue
+
+        if _SS.is_session(driver):
+            # Server mode. A picture-only site becomes Prism's own picture
+            # step; a tool with no server equivalent is shown as left out.
+            _swap = _SS.redirect_agent(stage, agent_name, agent_cfg)
+            if _swap:
+                ui.info(f"   {agent_name} is replaced by {_swap} (runs on "
+                        "your Prism plan).")
+                agent_name = _swap
+                agent_cfg = A.resolve_agent(stage, agent_name) or agent_cfg
+            _why = _SS.unsupported_reason(stage, agent_name, agent_cfg)
+            if _why:
+                ui.warn(f"   {_why}")
+                emit("stage_skipped", {"stage": stage, "agent": agent_name,
+                                       "reason": _why})
+                continue
 
         # A browser stage with no prompt is the run that uploads the files,
         # asks nothing, and waits the whole cap for an answer to a question
@@ -8219,6 +8302,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                 full_prompt = _maker_brief(agent_name, agent_cfg) + full_prompt
                                 full_prompt = _chat_header(run_title, stage) + full_prompt
                         full_prompt = _bmp_safe(full_prompt)  # strip emoji ChromeDriver can't type
+                        if _SS.is_session(driver):
+                            try:
+                                driver.send(full_prompt)
+                            except _ai.AiError as e:
+                                driver.last_error = _ai.plain(e)
+                                ui.err(f"   {driver.last_error}")
+                                nothing_was_sent = True
+                                break
+                            continue
                         prompt_phase = "waiting for the message box"
                         textarea = WebDriverWait(
                             driver, agent_cfg.get("input_wait", 15)).until(
@@ -8376,6 +8468,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     note = (f"{agent_name} never received the prompt, so there "
                             "is nothing to wait for. Its tab is open if you "
                             "want to send it by hand.")
+                    if _SS.is_session(driver):
+                        note = driver.last_error or "Prism's server did not answer."
                     ui.err(f"   {note}")
                     all_links[stage] = _safe_url(driver, exclude=tuple(
                         all_links.values()))
@@ -8385,9 +8479,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     # _retry_failed_stages can pick this stage up like any
                     # other — a prompt that never landed is exactly the kind
                     # worth retrying.
-                    failures[stage] = {"agent": agent_name,
-                                       "questions": questions,
-                                       "reason": note, "exhausted": False}
+                    if not _SS.is_session(driver):
+                        failures[stage] = {"agent": agent_name,
+                                           "questions": questions,
+                                           "reason": note, "exhausted": False}
                     continue
 
                 # A promised image is not a text answer. ChatGPT commonly
