@@ -194,7 +194,8 @@ def extract_details(message: Message, api_key: str = "", model: str = "") -> dic
     try:
         reply = groq_chat(api_key, model or "",
                           _DETAILS_PROMPT + message.snippet(3000),
-                          temperature=0.0, timeout=45)
+                          temperature=0.0, timeout=45,
+                          role="classify", addon="email", feature="inquiry_details")
     except Exception:
         return {}
     data = _json_from(reply)
@@ -339,7 +340,8 @@ def reply_intent(message: Message, api_key: str = "", model: str = "") -> str:
     try:
         reply = groq_chat(api_key, model or triage.FAST_MODEL,
                           _INTENT_PROMPT + message.snippet(1500),
-                          temperature=0.0, timeout=30)
+                          temperature=0.0, timeout=30,
+                          role="classify", addon="email", feature="reply_intent")
     except Exception:
         return UNCLEAR
     word = (reply or "").strip().lower()

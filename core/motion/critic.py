@@ -143,7 +143,8 @@ def critique(frames: list[tuple[int, bytes]], cfg: dict | None, model: str = MOD
     try:
         text = _or.openrouter_chat((cfg or {})["openrouter_api_key"].strip(), model, _RUBRIC,
                                    attachments=attachments, temperature=0.2, timeout=120, max_tokens=1500,
-                                   extra={"response_format": _SCHEMA}, usage_sink=usage)
+                                   extra={"response_format": _SCHEMA}, usage_sink=usage,
+                                   role="vision", addon="motion", feature="critic")
     except Exception as e:  # noqa: BLE001
         return {"defects": [], "cost": float(usage.get("cost") or 0.0), "skipped": f"the critic could not answer ({e})"}
     cost = float(usage.get("cost") or 0.0)

@@ -19,6 +19,8 @@ import time
 
 import requests
 
+from . import ai_client as _ai
+
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # A text model's answer and a generated picture are different jobs on
 # OpenRouter's own API, not one endpoint with a flag -- confirmed against
@@ -65,7 +67,9 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
                      retries: int = 1, max_tokens: int | None = None,
                      extra: dict | None = None,
                      usage_out: dict | None = None,
-                     usage_sink: dict | None = None) -> str:
+                     usage_sink: dict | None = None,
+                     role: str = "writer", addon: str = "core",
+                     feature: str = "") -> str:
     """One OpenRouter completion. `model` is an OpenRouter model id, e.g.
     "anthropic/claude-sonnet-5.5" — addons/boq/agents.py owns the mapping
     from a Prism Agent's display name to the model id actually sent here.
@@ -95,7 +99,18 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
     `total_tokens`) — a BOQ counter (addons/boq/history.py) sums these
     across runs for the token-usage figure it shows. A mutated-in-place
     dict rather than a second return value, so this stays a plain string
-    return for the many existing callers that already match on that."""
+    return for the many existing callers that already match on that.
+
+    When the AI seam is active (core.ai_client) the call goes to Prism's
+    licence server under `role`; `api_key` and `model` are not used (the model
+    is a hint), and `extra` (provider-side switches) is not sent."""
+    if _ai.active():
+        return _ai.chat(role, prompt, addon=addon, feature=feature or role,
+                        attachments=attachments, temperature=temperature,
+                        json_mode=bool((extra or {}).get("response_format")),
+                        max_tokens=max_tokens, timeout=timeout, retries=retries,
+                        usage_out=usage_out, usage_sink=usage_sink,
+                        model_hint=model)
     if not api_key:
         raise RuntimeError(
             "No OpenRouter key set. Add one in Settings → AI tools.")
@@ -184,7 +199,8 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
 
 def openrouter_image(api_key: str, model: str, prompt: str, *,
                      aspect_ratio: str = "1:1", resolution: str = "1K",
-                     timeout: int = 180, retries: int = 1) -> bytes:
+                     timeout: int = 180, retries: int = 1,
+                     addon: str = "core", feature: str = "image") -> bytes:
     """One OpenRouter image generation call -- the dedicated Images API
     (POST /api/v1/images), not /chat/completions: this model's deliverable
     IS the image, not a text reply describing one. `model` is an
@@ -194,7 +210,14 @@ def openrouter_image(api_key: str, model: str, prompt: str, *,
 
     Same retry-on-429/5xx shape and the same rule that a failure raises
     with the server's own words, as openrouter_chat -- this is its sibling
-    for a provider that answers with pixels instead of tokens."""
+    for a provider that answers with pixels instead of tokens.
+
+    When the AI seam is active the picture is made by Prism's licence server
+    (role "image"); `api_key` and `model` are not used."""
+    if _ai.active():
+        return _ai.image(prompt, addon=addon, feature=feature,
+                         aspect_ratio=aspect_ratio, resolution=resolution,
+                         timeout=timeout, retries=retries, model_hint=model)
     if not api_key:
         raise RuntimeError(
             "No OpenRouter key set. Add one in Settings → AI tools.")

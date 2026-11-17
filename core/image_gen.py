@@ -23,6 +23,7 @@ import datetime as _dt
 import os
 import time
 
+from . import ai_client as _ai
 from . import openrouter as _openrouter
 
 # OpenRouter's own id for the model (confirmed live against
@@ -294,7 +295,8 @@ def build_single_prompt(query: str, context: str, cfg: dict,
         text = _openrouter.openrouter_chat(
             api_key, BRIEF_MODEL,
             _single_brief_prompt(query, context, skill_text),
-            temperature=0.5, timeout=60)
+            temperature=0.5, timeout=60,
+            role="writer", addon="image", feature="brief")
     except Exception:                                         # noqa: BLE001
         return ""
     return (text or "").strip()
@@ -446,7 +448,8 @@ def build_prompts(query: str, context: str, cfg: dict, *, n: int = 6,
         text = _openrouter.openrouter_chat(
             api_key, BRIEF_MODEL,
             _brief_meta_prompt(query, context, n, has_own_artwork, film),
-            temperature=0.5, timeout=60)
+            temperature=0.5, timeout=60,
+            role="writer", addon="image", feature="briefs")
     except Exception:                                         # noqa: BLE001
         return []
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
@@ -481,6 +484,7 @@ def generate_artwork(query: str, prior_text, cfg: dict, *,
     os.makedirs(_config.RUNS_DIR, exist_ok=True)
 
     out_paths = []
+    why = ""
     for i, prompt in enumerate(prompts, 1):
         plate = film and i <= len(_SCENE_ROLES)
         full = prompt if plate else (
@@ -491,6 +495,10 @@ def generate_artwork(query: str, prior_text, cfg: dict, *,
                 api_key, MODEL, full, aspect_ratio="9:16" if plate else "4:5",
                 resolution="1K")
         except Exception as e:                                # noqa: BLE001
+            # A refusal from Prism's server (out of credits, AI paused) is
+            # worth saying; one picture failing among six is not.
+            if isinstance(e, _ai.AiError) and not why:
+                why = str(e)
             continue
         raw = os.path.join(_config.RUNS_DIR,
                            f"flux_{int(time.time())}_{i}.png")
@@ -500,5 +508,5 @@ def generate_artwork(query: str, prior_text, cfg: dict, *,
         out_paths.append(raw if plate else _assets.prepare(raw, _config.RUNS_DIR)["path"])
 
     if not out_paths:
-        return [], "FLUX 3 Klein could not draw any of the images."
+        return [], why or "FLUX 3 Klein could not draw any of the images."
     return out_paths, f"FLUX 3 Klein drew {len(out_paths)} image(s)."

@@ -14,6 +14,7 @@ import re
 import requests
 
 from . import agents as A
+from . import ai_client as _ai
 from . import config as C
 from . import skills as SK
 from . import ui
@@ -136,7 +137,8 @@ def _model_is_gone(status: int, body: dict) -> bool:
 
 
 def groq_chat(api_key: str, model: str, prompt: str, *, temperature: float = 0.3,
-              timeout: int = 60, retries: int = 1, json_mode: bool = False) -> str:
+              timeout: int = 60, retries: int = 1, json_mode: bool = False,
+              role: str = "planner", addon: str = "core", feature: str = "") -> str:
     """One Groq completion, with the two failures a daily user actually hits.
 
     Rate limits are retried after the wait Groq asks for; a retired model falls
@@ -152,7 +154,14 @@ def groq_chat(api_key: str, model: str, prompt: str, *, temperature: float = 0.3
     error, with a real completion signal instead of a 300s stability guess.
     The prompt must itself mention JSON somewhere or Groq rejects the request;
     Prism's machine-stage prompts already say "reply with only a JSON object".
+
+    When the AI seam is active (core.ai_client) the call goes to Prism's
+    licence server under `role` and the key and model arguments are not used.
     """
+    if _ai.active():
+        return _ai.chat(role, prompt, addon=addon, feature=feature or role,
+                        json_mode=json_mode, temperature=temperature,
+                        timeout=timeout, retries=retries, model_hint=model)
     headers = {"Authorization": f"Bearer {api_key}",
                "Content-Type": "application/json"}
     last = ""

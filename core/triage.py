@@ -402,7 +402,8 @@ def classify(messages: list[Message], api_key: str = "", *,
                                 f"({len(batch)} message(s))"):
             try:
                 reply = groq_chat(api_key, current, _prompt(batch),
-                                  temperature=0.0, timeout=45)
+                                  temperature=0.0, timeout=45,
+                                  role="classify", addon="email", feature="triage")
                 current = C.load().get("model") or current
             except Exception as e:
                 checklog.line(f"batch {batch_no} failed: {e}")

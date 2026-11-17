@@ -99,12 +99,25 @@ DEFAULT = {
 }
 
 
+def _through_server(cfg: dict) -> dict:
+    """When AI runs through Prism's server (core.ai_client), the two provider
+    key fields read as the stand-in value, so "is a key set?" checks pass and
+    the real keys on disk are never handed to anything. save() puts the real
+    values back, so this never reaches the file."""
+    from . import ai_client
+    if ai_client.active():
+        cfg = dict(cfg)
+        for k in ai_client.KEY_FIELDS:
+            cfg[k] = ai_client.AI_KEY
+    return cfg
+
+
 def load() -> dict:
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return {**DEFAULT, **data}
+            return _through_server({**DEFAULT, **data})
         except Exception:
             # An unreadable config used to fall through to DEFAULT in silence,
             # which looks exactly like a fresh install: the user is asked to
@@ -112,7 +125,7 @@ def load() -> dict:
             # bad file — it still contains their API key and agent choices,
             # recoverable by hand — and leave a trail saying so.
             _quarantine(CONFIG_PATH)
-    return dict(DEFAULT)
+    return _through_server(dict(DEFAULT))
 
 
 def _quarantine(path: str) -> str:
@@ -156,6 +169,23 @@ def save(cfg: dict) -> None:
                     cfg[_k] = _disk[_k]
     except Exception:
         pass        # an unreadable disk copy must not stop a legitimate save
+    # The stand-in key (see _through_server) is never written: whatever the
+    # file held for that field stays, and a field it never held stays absent.
+    from . import ai_client as _ai
+    if any(cfg.get(_k) == _ai.AI_KEY for _k in _ai.KEY_FIELDS):
+        cfg = dict(cfg)
+        _held = {}
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as _f:
+                _held = json.load(_f)
+        except Exception:
+            pass
+        for _k in _ai.KEY_FIELDS:
+            if cfg.get(_k) == _ai.AI_KEY:
+                if _held.get(_k):
+                    cfg[_k] = _held[_k]
+                else:
+                    cfg.pop(_k, None)
     os.makedirs(CONFIG_DIR, exist_ok=True)
     tmp = f"{CONFIG_PATH}.tmp"
     try:

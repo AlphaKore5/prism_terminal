@@ -19,6 +19,13 @@ import time
 import wave
 import requests
 
+from . import ai_client as _ai
+
+# Speech-to-text has no route on Prism's AI server yet (it is not a chat
+# completion), so with AI running through the server there is no key to send.
+VOICE_UNAVAILABLE = ("Voice dictation isn't part of your Prism plan yet, so it "
+                     "can't be used right now. Type your request instead.")
+
 TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 WHISPER_MODEL = "whisper-large-v3"   # OpenAI's open-source Whisper, hosted by Groq
@@ -167,6 +174,8 @@ def record_until(should_stop) -> bytes:
 
 def transcribe(wav_bytes: bytes, cfg: dict) -> tuple[str, str]:
     """Send a WAV recording to Groq Whisper. Returns (text, detected_language)."""
+    if _ai.is_server_key(cfg.get("api_key")):
+        raise RuntimeError(VOICE_UNAVAILABLE)
     resp = requests.post(
         TRANSCRIBE_URL,
         headers={"Authorization": f"Bearer {cfg.get('api_key', '')}"},
@@ -247,17 +256,21 @@ Return ONLY JSON:
 
 Transcript: {raw}"""
     try:
-        resp = requests.post(
-            CHAT_URL,
-            headers={"Authorization": f"Bearer {api_key}",
-                     "Content-Type": "application/json"},
-            json={"model": cfg.get("model", "llama-3.3-70b-versatile"),
-                  "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0},
-            timeout=45,
-        )
-        rj = resp.json()
-        text = rj["choices"][0]["message"]["content"]
+        if _ai.active():
+            text = _ai.chat("classify", prompt, addon="core", feature="dictation",
+                            temperature=0, timeout=45)
+        else:
+            resp = requests.post(
+                CHAT_URL,
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+                json={"model": cfg.get("model", "llama-3.3-70b-versatile"),
+                      "messages": [{"role": "user", "content": prompt}],
+                      "temperature": 0},
+                timeout=45,
+            )
+            rj = resp.json()
+            text = rj["choices"][0]["message"]["content"]
         s, e = text.find("{"), text.rfind("}") + 1
         data = json.loads(text[s:e])
         return {

@@ -8995,7 +8995,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             from . import router as _router
                             groq_got = _router.groq_chat(
                                 cfg.get("api_key", ""), cfg.get("model", ""),
-                                api_prompt, json_mode=True, timeout=90)
+                                api_prompt, json_mode=True, timeout=90,
+                                role="writer", addon="reel", feature="spec_fallback")
                             if _reel.has_spec(groq_got):
                                 stage_responses = [groq_got]
                                 ui.ok("   ✓  Groq produced a valid scene spec")
