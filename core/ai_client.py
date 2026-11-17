@@ -88,6 +88,25 @@ def set_auth_provider(fn: Optional[Callable[[], dict]]) -> None:
     _auth_provider = fn
 
 
+_listener: Optional[Callable[[dict], None]] = None
+
+
+def set_usage_listener(fn: Optional[Callable[[dict], None]]) -> None:
+    """The host app hears every answer's balance and charge (no prompt, no
+    text), so a credits chip can stay current without asking again."""
+    global _listener
+    _listener = fn
+
+
+def _heard(data: dict) -> None:
+    if _listener is not None and isinstance(data, dict) and "balance_mc" in data:
+        try:
+            _listener({"balance_mc": data.get("balance_mc"),
+                       "charged_mc": data.get("charged_mc", 0)})
+        except Exception:                                   # noqa: BLE001
+            pass            # a display must never break a call
+
+
 def set_transport(fn: Optional[Callable]) -> None:
     """Tests only: answer every non-streaming call with fn(path, body, bearer)
     -> dict (or raise AiError). None restores the real HTTP call."""
@@ -267,6 +286,7 @@ def chat(role: str, prompt: str, *, addon: str = "core", feature: str = "",
                       json_mode=json_mode, temperature=temperature,
                       max_tokens=max_tokens, system=system)
     data = _post(PATH_CHAT, body, bearer=True, timeout=timeout, retries=retries)
+    _heard(data)
     text = data.get("text") or ""
     for sink in (usage_out, usage_sink):
         _fill_usage(sink, data)
@@ -328,6 +348,7 @@ def stream(role: str, prompt: str, *, addon: str = "core", feature: str = "",
                     if event == "delta":
                         yield data.get("t", "")
                     elif event == "done":
+                        _heard(data)
                         _fill_usage(usage_out, data)
                         return
                     elif event == "error":
@@ -363,6 +384,7 @@ def image(prompt: str, *, role: str = "image", addon: str = "core",
     body.update({"prompt": prompt, "aspect_ratio": _server_aspect(aspect_ratio),
                  "resolution": resolution, "n": 1})
     data = _post(PATH_IMAGE, body, bearer=True, timeout=timeout, retries=retries)
+    _heard(data)
     imgs = data.get("images") or []
     first = imgs[0] if imgs else ""
     if isinstance(first, dict):

@@ -349,7 +349,7 @@ def generate(query: str, prior_text, cfg: dict, attachments=None, *,
     try:
         data = _openrouter.openrouter_image(
             api_key, MODEL, prompt, aspect_ratio=aspect_ratio,
-            resolution=resolution)
+            resolution=resolution, addon="image")
     except Exception as e:                                  # noqa: BLE001
         return "", str(e)
 
@@ -493,7 +493,7 @@ def generate_artwork(query: str, prior_text, cfg: dict, *,
         try:
             data = _openrouter.openrouter_image(
                 api_key, MODEL, full, aspect_ratio="9:16" if plate else "4:5",
-                resolution="1K")
+                resolution="1K", addon="image")
         except Exception as e:                                # noqa: BLE001
             # A refusal from Prism's server (out of credits, AI paused) is
             # worth saying; one picture failing among six is not.
