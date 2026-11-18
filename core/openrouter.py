@@ -69,7 +69,7 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
                      usage_out: dict | None = None,
                      usage_sink: dict | None = None,
                      role: str = "writer", addon: str = "core",
-                     feature: str = "") -> str:
+                     feature: str = "", pin_model: bool = False) -> str:
     """One OpenRouter completion. `model` is an OpenRouter model id, e.g.
     "anthropic/claude-sonnet-5.5" — addons/boq/agents.py owns the mapping
     from a Prism Agent's display name to the model id actually sent here.
@@ -103,14 +103,16 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
 
     When the AI seam is active (core.ai_client) the call goes to Prism's
     licence server under `role`; `api_key` and `model` are not used (the model
-    is a hint), and `extra` (provider-side switches) is not sent."""
+    is a hint unless `pin_model` is set: then it is the person's own pick and is
+    sent for the server to check against its allow-list), and `extra`
+    (provider-side switches) is not sent."""
     if _ai.active():
         return _ai.chat(role, prompt, addon=addon, feature=feature or role,
                         attachments=attachments, temperature=temperature,
                         json_mode=bool((extra or {}).get("response_format")),
                         max_tokens=max_tokens, timeout=timeout, retries=retries,
                         usage_out=usage_out, usage_sink=usage_sink,
-                        model_hint=model)
+                        model_hint=model, model=model if pin_model else "")
     if not api_key:
         raise RuntimeError(
             "No OpenRouter key set. Add one in Settings → AI tools.")

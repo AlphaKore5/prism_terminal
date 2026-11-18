@@ -139,6 +139,13 @@ def _get_driver(cfg: dict):
     """Return (driver, fresh) — reusing the still-open browser from a
     previous run when possible, so results left on screen aren't disturbed."""
     global _active_driver
+    if _ai.active():
+        # Server mode: every AI step is a call to Prism's server. Reaching
+        # this line is a bug in the caller, and a loud one beats a Chrome
+        # window opening on a customer's desktop.
+        raise RuntimeError("Prism AI runs on Prism's server and never opens "
+                           "a browser. (This is a bug: please tell Prism "
+                           "support.)")
     if _active_driver is not None:
         try:
             _active_driver.window_handles  # cheap liveness probe
@@ -6877,7 +6884,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         if on_event:
             on_event(kind, payload)
 
-    agents = {k: v for k, v in (cfg.get("agents") or {}).items() if v}
+    agents = A.server_effective(cfg.get("agents"))
     stages = list(custom_stages) if custom_stages is not None else list(_needed_stages(routing, agents))
     if not stages:
         ui.warn("Router marked every stage as not-needed — nothing to run.")

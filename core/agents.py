@@ -173,6 +173,40 @@ def prune_for_server() -> None:
                           if n not in _NO_SERVER_EQUIVALENT]
 
 
+# Stages Prism fills in by itself in server mode when the person has not
+# picked a tool: there is no website to sign in to any more, so "no tool
+# chosen" is not a reason for a reel to come back as one picture.
+_SERVER_FILLED = ("research", "brains", "content", "visual", "media")
+_SERVER_LOCAL_DEFAULT = {"visual": "Prism Image", "media": "Prism Studio"}
+
+
+def server_effective(agents: dict | None) -> dict:
+    """The stage -> tool map a run really uses when AI runs on Prism's server.
+
+    Visual and video always have a local tool behind them (Prism Image;
+    Prism Studio / Reel / Motion), whatever website the saved config names
+    (ChatGPT, Runway, ...) or whether it names anything. The other writing
+    stages get the first tool of their category when none is set. Nothing is
+    written back to the config."""
+    from . import ai_client
+    out = {k: v for k, v in (agents or {}).items() if v}
+    if not ai_client.active():
+        return out
+    for stage in _SERVER_FILLED:
+        cat = CATEGORIES.get(stage)
+        if not cat:
+            continue
+        name = out.get(stage)
+        local = _SERVER_LOCAL_DEFAULT.get(stage)
+        if local:
+            if not name or not (AGENT_REGISTRY.get(name) or {}).get("local"):
+                if local in cat["agents"]:
+                    out[stage] = local
+        elif not name and cat["agents"]:
+            out[stage] = cat["agents"][0]
+    return out
+
+
 # The "summary" stage is not user-selectable; it reuses whichever agent the
 # user picked for "brains" (falling back to content / research).
 SUMMARY_FALLBACK_ORDER = ["brains", "content", "research"]
@@ -898,9 +932,8 @@ AGENT_REGISTRY = {
     # a fresh install.
     "Prism Image": _agent(
         "local://flux_image",
-        "FLUX 3 Klein (Black Forest Labs), called directly through your "
-        "own OpenRouter key — a real generated picture in seconds, no "
-        "browser tab, no separate account to sign into",
+        "a real generated picture in seconds from a written picture brief, "
+        "with no browser tab and no separate account to sign into",
         "API key", "5–15s", 30,
         local="flux_image",
     ),

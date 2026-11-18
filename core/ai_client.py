@@ -278,13 +278,17 @@ def chat(role: str, prompt: str, *, addon: str = "core", feature: str = "",
          temperature: float | None = None, max_tokens: int | None = None,
          system: str = "", timeout: int = 180, retries: int = 1,
          usage_out: dict | None = None, usage_sink: dict | None = None,
-         artifact_ref: str = "", model_hint: str = "") -> str:
+         artifact_ref: str = "", model_hint: str = "", model: str = "") -> str:
     """One answer from the server. `model_hint` is accepted for the callers
-    that still name a model and is deliberately not sent."""
+    that still name a model and is deliberately not sent. `model` is the
+    opposite: the person picked it (STEP's Haiku / Sonnet), so it is sent and
+    the server checks it against its own allow-list."""
     body = _chat_body(role, prompt, attachments, addon=addon,
                       feature=feature or role, artifact_ref=artifact_ref,
                       json_mode=json_mode, temperature=temperature,
                       max_tokens=max_tokens, system=system)
+    if model:
+        body["model"] = model
     data = _post(PATH_CHAT, body, bearer=True, timeout=timeout, retries=retries)
     _heard(data)
     text = data.get("text") or ""

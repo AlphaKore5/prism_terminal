@@ -216,7 +216,8 @@ def is_configured(cfg: dict) -> bool:
 
 def active_agents(cfg: dict) -> dict:
     """Categories the user actually assigned an agent to."""
-    return {k: v for k, v in (cfg.get("agents") or {}).items() if v}
+    from . import agents as _A
+    return _A.server_effective(cfg.get("agents"))
 
 
 def save_run(record: dict, runs_dir: str = "", path: str = "") -> str:

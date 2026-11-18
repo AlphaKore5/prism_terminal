@@ -81,7 +81,8 @@ def choose_agent(cfg: dict) -> str:
     send them to a tool they are not signed in to, and the run would die on a
     login wall.
     """
-    agents = {k: v for k, v in (cfg.get("agents") or {}).items() if v}
+    from . import agents as _A
+    agents = _A.server_effective(cfg.get("agents"))
     for stage in STAGE_ORDER:
         if agents.get(stage):
             return agents[stage]

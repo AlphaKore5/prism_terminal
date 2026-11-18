@@ -280,6 +280,13 @@ def _single_brief_prompt(query: str, context: str, skill_text: str = "") -> str:
     )
 
 
+def _maker() -> str:
+    """Who drew it, in words a customer should see: in server mode the picture
+    comes from Prism's server, not from a named model."""
+    from . import ai_client
+    return "Prism AI" if ai_client.active() else "FLUX 3 Klein"
+
+
 def build_single_prompt(query: str, context: str, cfg: dict,
                         skill_text: str = "") -> str:
     """ONE complete FLUX prompt, written by Claude Haiku 5.5 from the
@@ -362,7 +369,7 @@ def generate(query: str, prior_text, cfg: dict, attachments=None, *,
     # "earlier result" reference (main_window._followup_prompt) reads
     # responses[stage] back; a bare filename told it nothing about what
     # the picture actually showed, which is bug #2 above in a nutshell.
-    note = f"FLUX 3 Klein drew: {prompt[:280]}"
+    note = f"{_maker()} drew: {prompt[:280]}"
     if logo_path:
         try:
             _composite_logo(out, logo_path)
@@ -508,5 +515,5 @@ def generate_artwork(query: str, prior_text, cfg: dict, *,
         out_paths.append(raw if plate else _assets.prepare(raw, _config.RUNS_DIR)["path"])
 
     if not out_paths:
-        return [], why or "FLUX 3 Klein could not draw any of the images."
-    return out_paths, f"FLUX 3 Klein drew {len(out_paths)} image(s)."
+        return [], why or f"{_maker()} could not draw any of the images."
+    return out_paths, f"{_maker()} drew {len(out_paths)} image(s)."
