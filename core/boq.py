@@ -486,6 +486,14 @@ def dwg_to_dxf(dwg_path: str, out_dir: str | None = None) -> tuple[str, list[str
         # conversion, and on macOS/Linux this stays the old call unchanged
         # (startupinfo=None, creationflags=0).
         run_kwargs: dict = {}
+        # ODA is a Qt program with its own Qt. Prism is a Qt program too, and its
+        # Qt settings (QT_QPA_PLATFORM, QT_PLUGIN_PATH, QML2_IMPORT_PATH...) are
+        # inherited by anything it launches. Handed those, ODA looks for its
+        # platform plugin in Prism's Qt and dies ("Could not find the Qt platform
+        # plugin", exit 134 -- seen here on Linux with QT_QPA_PLATFORM=offscreen).
+        # So ODA gets the environment without any Qt variable.
+        run_kwargs["env"] = {k: v for k, v in os.environ.items()
+                             if not k.upper().startswith("QT_") and k.upper() != "QML2_IMPORT_PATH"}
         if os.name == "nt":
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
