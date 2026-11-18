@@ -199,7 +199,10 @@ def platform_tag() -> str:
     """The wheel tag for this machine, as PyPI names it."""
     machine = platform.machine().lower()
     if sys.platform.startswith("win"):
-        return "win_amd64" if machine in ("amd64", "x86_64") else "win32"
+        # Windows on ARM runs the x64 FFmpeg through its own emulation; the
+        # 32-bit "win32" wheel is the wrong answer there (and Python 3.12
+        # reports ARM64 even for an x64 Prism running under emulation).
+        return "win_amd64" if machine in ("amd64", "x86_64", "arm64", "aarch64") else "win32"
     if sys.platform == "darwin":
         return "macosx_11_0_arm64" if machine in ("arm64", "aarch64") else "macosx_10_9_x86_64"
     if machine in ("aarch64", "arm64"):
