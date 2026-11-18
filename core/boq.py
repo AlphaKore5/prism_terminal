@@ -116,9 +116,17 @@ def _dwg2dxf_platform_tag() -> str | None:
     machine = platform.machine().lower()
     if system == "Darwin" and machine in ("arm64", "aarch64"):
         return "macos-arm64"
-    if system == "Windows" and machine in ("amd64", "x86_64"):
+    # Windows on ARM runs the x64 build through its own emulation (Windows 11),
+    # and LibreDWG publishes no ARM build, so ARM64 uses the same files.
+    if system == "Windows" and machine in ("amd64", "x86_64", "arm64", "aarch64"):
         return "win64"
     return None
+
+
+#: Why Prism's own converter could not be set up on this machine, or "". It was swallowed silently
+#: before, so a person was told "no converter found" with no hint that one was bundled and failed
+#: to install (antivirus, a read-only folder, a build without the files).
+BUNDLED_PROBLEM = ""
 
 
 def _ensure_bundled_dwg2dxf() -> None:
@@ -129,13 +137,18 @@ def _ensure_bundled_dwg2dxf() -> None:
     tools-dir glob finds nothing new and the search falls through to PATH /
     an installed converter / "please install one", same as before this
     function existed."""
+    global BUNDLED_PROBLEM
+    BUNDLED_PROBLEM = ""
     tag = _dwg2dxf_platform_tag()
     if not tag:
+        BUNDLED_PROBLEM = (f"Prism has no built-in converter for this computer "
+                           f"({platform.system()} {platform.machine()}).")
         return
     exe_name = "dwg2dxf.exe" if tag.startswith("win") else "dwg2dxf"
     src_dir = os.path.join(_HERE, "vendor", "dwg2dxf", tag)
     src_exe = os.path.join(src_dir, exe_name)
     if not os.path.isfile(src_exe):
+        BUNDLED_PROBLEM = "Prism's built-in converter is missing from this copy of Prism."
         return  # this checkout/build doesn't carry a vendor copy
 
     try:
@@ -158,8 +171,10 @@ def _ensure_bundled_dwg2dxf() -> None:
                 continue
             shutil.copy2(os.path.join(src_dir, name), os.path.join(dst_dir, name))
         os.chmod(dst_exe, 0o755)  # PyInstaller's own datas don't promise the +x bit survives
-    except OSError:
-        pass  # read-only tools dir, disk full, permissions — not fatal, see docstring
+    except OSError as e:
+        # Not fatal, but say why: security software removing or locking the file shows up here.
+        BUNDLED_PROBLEM = (f"Prism's built-in converter could not be set up in {dst_dir} ({e}). "
+                           "Security software may be blocking it.")
 
 
 def _installed_converter_paths() -> list[str]:
@@ -405,7 +420,8 @@ def dwg_to_dxf(dwg_path: str, out_dir: str | None = None) -> tuple[str, list[str
         # answer on all three.
         raise NoConverterError(
             NO_CONVERTER_TEXT + "\n"
-            "Get it here (free): https://www.opendesign.com/guestfiles/oda_file_converter\n"
+            + (BUNDLED_PROBLEM + "\n" if BUNDLED_PROBLEM else "")
+            + "Get it here (free): https://www.opendesign.com/guestfiles/oda_file_converter\n"
             "Or save the drawing as a DXF file and attach that instead.")
     out_dir = out_dir or tempfile.mkdtemp(prefix="prism_boq_")
     name = os.path.splitext(os.path.basename(dwg_path))[0]
