@@ -50,6 +50,7 @@ PATH_CHAT = "/v1/ai/chat"
 PATH_STREAM = "/v1/ai/chat/stream"
 PATH_IMAGE = "/v1/ai/image"
 PATH_RUN_COST = "/v1/ai/run-cost"
+PATH_USAGE = "/v1/ai/usage"
 
 _RETRY_STATUS = (500, 502, 503, 504)
 
@@ -98,11 +99,23 @@ def set_usage_listener(fn: Optional[Callable[[dict], None]]) -> None:
     _listener = fn
 
 
-def _heard(data: dict) -> None:
+def _heard(data: dict, body: dict | None = None) -> None:
     if _listener is not None and isinstance(data, dict) and "balance_mc" in data:
+        body = body or {}
+        model = data.get("model")
         try:
             _listener({"balance_mc": data.get("balance_mc"),
-                       "charged_mc": data.get("charged_mc", 0)})
+                       "charged_mc": data.get("charged_mc", 0),
+                       # What the call was (no prompt, no text), so the host
+                       # can keep a this-session list when the server has no
+                       # usage route.
+                       "addon": body.get("addon", ""),
+                       "feature": body.get("feature", ""),
+                       "role": body.get("role", ""),
+                       "model_label": (model.get("label", "")
+                                       if isinstance(model, dict) else ""),
+                       "run_id": body.get("run_id", ""),
+                       "ts": int(time.time())})
         except Exception:                                   # noqa: BLE001
             pass            # a display must never break a call
 
@@ -290,7 +303,7 @@ def chat(role: str, prompt: str, *, addon: str = "core", feature: str = "",
     if model:
         body["model"] = model
     data = _post(PATH_CHAT, body, bearer=True, timeout=timeout, retries=retries)
-    _heard(data)
+    _heard(data, body)
     text = data.get("text") or ""
     for sink in (usage_out, usage_sink):
         _fill_usage(sink, data)
@@ -352,7 +365,7 @@ def stream(role: str, prompt: str, *, addon: str = "core", feature: str = "",
                     if event == "delta":
                         yield data.get("t", "")
                     elif event == "done":
-                        _heard(data)
+                        _heard(data, body)
                         _fill_usage(usage_out, data)
                         return
                     elif event == "error":
@@ -388,7 +401,7 @@ def image(prompt: str, *, role: str = "image", addon: str = "core",
     body.update({"prompt": prompt, "aspect_ratio": _server_aspect(aspect_ratio),
                  "resolution": resolution, "n": 1})
     data = _post(PATH_IMAGE, body, bearer=True, timeout=timeout, retries=retries)
-    _heard(data)
+    _heard(data, body)
     imgs = data.get("images") or []
     first = imgs[0] if imgs else ""
     if isinstance(first, dict):
@@ -421,6 +434,35 @@ def status(timeout: int = 15) -> dict:
 def run_cost(run_ids: list[str], timeout: int = 15) -> dict:
     return _post(PATH_RUN_COST, {"run_ids": list(run_ids)}, bearer=False,
                  timeout=timeout, retries=0)
+
+
+def usage(limit: int = 50, before: str = "", timeout: int = 20) -> dict:
+    """What this licence spent: balance, this cycle, today, by add-on, by day
+    and a page of recent calls (GET /v1/ai/usage; `next` is the next `before`).
+
+    A 404 means an older server without the route: it raises AiError
+    NOT_SET_UP (status 404), which the caller turns into "this session only".
+    Blocking: call it from a worker thread, never from the UI thread."""
+    a = _auth()
+    q = {"license_id": a["license_id"], "device_fp": a["device_fp"],
+         "limit": int(limit)}
+    if before:
+        q["before"] = str(before)
+    if _send is not None:
+        return _send(PATH_USAGE, q, a.get("lease", ""))
+    url = str(a["base_url"]).rstrip("/") + PATH_USAGE
+    try:
+        resp = requests.get(url, params=q, headers=_headers(a, True),
+                            timeout=timeout)
+    except requests.RequestException as e:
+        raise AiError("UNREACHABLE", _OFFLINE) from e
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {}
+    if resp.status_code < 400:
+        return data
+    _raise_for(resp.status_code, data)
 
 
 def plain(e: BaseException) -> str:
