@@ -99,11 +99,23 @@ def set_usage_listener(fn: Optional[Callable[[dict], None]]) -> None:
     _listener = fn
 
 
-def _heard(data: dict) -> None:
+def _heard(data: dict, body: dict | None = None) -> None:
     if _listener is not None and isinstance(data, dict) and "balance_mc" in data:
+        body = body or {}
+        model = data.get("model")
         try:
             _listener({"balance_mc": data.get("balance_mc"),
-                       "charged_mc": data.get("charged_mc", 0)})
+                       "charged_mc": data.get("charged_mc", 0),
+                       # What the call was (no prompt, no text), so the host
+                       # can keep a this-session list when the server has no
+                       # usage route.
+                       "addon": body.get("addon", ""),
+                       "feature": body.get("feature", ""),
+                       "role": body.get("role", ""),
+                       "model_label": (model.get("label", "")
+                                       if isinstance(model, dict) else ""),
+                       "run_id": body.get("run_id", ""),
+                       "ts": int(time.time())})
         except Exception:                                   # noqa: BLE001
             pass            # a display must never break a call
 
@@ -287,7 +299,7 @@ def chat(role: str, prompt: str, *, addon: str = "core", feature: str = "",
                       json_mode=json_mode, temperature=temperature,
                       max_tokens=max_tokens, system=system)
     data = _post(PATH_CHAT, body, bearer=True, timeout=timeout, retries=retries)
-    _heard(data)
+    _heard(data, body)
     text = data.get("text") or ""
     for sink in (usage_out, usage_sink):
         _fill_usage(sink, data)
@@ -349,7 +361,7 @@ def stream(role: str, prompt: str, *, addon: str = "core", feature: str = "",
                     if event == "delta":
                         yield data.get("t", "")
                     elif event == "done":
-                        _heard(data)
+                        _heard(data, body)
                         _fill_usage(usage_out, data)
                         return
                     elif event == "error":
@@ -385,7 +397,7 @@ def image(prompt: str, *, role: str = "image", addon: str = "core",
     body.update({"prompt": prompt, "aspect_ratio": _server_aspect(aspect_ratio),
                  "resolution": resolution, "n": 1})
     data = _post(PATH_IMAGE, body, bearer=True, timeout=timeout, retries=retries)
-    _heard(data)
+    _heard(data, body)
     imgs = data.get("images") or []
     first = imgs[0] if imgs else ""
     if isinstance(first, dict):
