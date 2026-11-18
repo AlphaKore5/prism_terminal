@@ -50,6 +50,7 @@ PATH_CHAT = "/v1/ai/chat"
 PATH_STREAM = "/v1/ai/chat/stream"
 PATH_IMAGE = "/v1/ai/image"
 PATH_RUN_COST = "/v1/ai/run-cost"
+PATH_USAGE = "/v1/ai/usage"
 
 _RETRY_STATUS = (500, 502, 503, 504)
 
@@ -417,6 +418,35 @@ def status(timeout: int = 15) -> dict:
 def run_cost(run_ids: list[str], timeout: int = 15) -> dict:
     return _post(PATH_RUN_COST, {"run_ids": list(run_ids)}, bearer=False,
                  timeout=timeout, retries=0)
+
+
+def usage(limit: int = 50, before: str = "", timeout: int = 20) -> dict:
+    """What this licence spent: balance, this cycle, today, by add-on, by day
+    and a page of recent calls (GET /v1/ai/usage; `next` is the next `before`).
+
+    A 404 means an older server without the route: it raises AiError
+    NOT_SET_UP (status 404), which the caller turns into "this session only".
+    Blocking: call it from a worker thread, never from the UI thread."""
+    a = _auth()
+    q = {"license_id": a["license_id"], "device_fp": a["device_fp"],
+         "limit": int(limit)}
+    if before:
+        q["before"] = str(before)
+    if _send is not None:
+        return _send(PATH_USAGE, q, a.get("lease", ""))
+    url = str(a["base_url"]).rstrip("/") + PATH_USAGE
+    try:
+        resp = requests.get(url, params=q, headers=_headers(a, True),
+                            timeout=timeout)
+    except requests.RequestException as e:
+        raise AiError("UNREACHABLE", _OFFLINE) from e
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {}
+    if resp.status_code < 400:
+        return data
+    _raise_for(resp.status_code, data)
 
 
 def plain(e: BaseException) -> str:
