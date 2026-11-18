@@ -346,6 +346,17 @@ def can_write(ext: str) -> bool:
     return (ext or "") in _WRITABLE
 
 
+def wants_structured(ext: str, text: str = "") -> bool:
+    """Is this a file Prism asks the model to describe as JSON (core/filespec)
+    rather than write as Markdown? Spreadsheets and CSV always; a Word or PDF
+    document when the text it would be made from holds a table. Plain prose
+    stays on the Markdown path."""
+    from . import filespec                                  # noqa: PLC0415
+    if ext in (".xlsx", ".csv"):
+        return True
+    return ext in (".docx", ".pdf") and filespec.has_markdown_table(text)
+
+
 # ── the last resort: write the document ourselves ────────────────────────
 
 _HEADING = re.compile(r"^(#{1,4})\s+(.*)$")
@@ -370,6 +381,18 @@ def document_from_text(text: str, out_dir: str, stem: str,
     text = (text or "").strip()
     if not text or not can_write(ext):
         return "", ""
+    if ext == ".csv":
+        # CSV is data: only a real table in the text, made through the spec so
+        # it gets the BOM and the formula guard (core/filespec.py).
+        from . import filespec                              # noqa: PLC0415
+        data = filespec.spec_from_markdown_table(text, stem, "csv")
+        if not data:
+            return "", ""
+        try:
+            made = filespec.render(data, out_dir)
+        except filespec.FileSpecError:
+            return "", ""
+        return made[0]["path"], "Prism made this CSV from the table in the AI's answer"
     # A spreadsheet is only made when the answer holds a real table; building
     # one from prose would be a worse deliverable than an honest "not produced".
     if ext == ".xlsx" and not re.search(r"^\s*\|.+\|\s*$", text, re.M):

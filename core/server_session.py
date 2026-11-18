@@ -115,6 +115,22 @@ def _attachment_blocks(attachments) -> list[dict]:
     return out
 
 
+def replay_prompt(turns: list[tuple[str, str]], prompt: str) -> str:
+    """`prompt` with the earlier turns of the conversation replayed in front
+    of it, newest kept, the whole capped at _MAX_HISTORY_CHARS."""
+    if not turns:
+        return prompt
+    parts, used = [], len(prompt)
+    for who, text in reversed(turns):
+        used += len(text) + 12
+        if used > _MAX_HISTORY_CHARS:
+            break
+        parts.append(f"{who}: {text}")
+    history = "\n\n".join(reversed(parts))
+    return ("This is a continuing conversation. Earlier turns:\n\n"
+            f"{history}\n\nNow the user writes:\n\n{prompt}")
+
+
 class ServerSession:
     """Stands where the Selenium driver stood. One conversation per stage."""
 
@@ -143,17 +159,7 @@ class ServerSession:
         return 0                        # 0: also paste the text, as for any tool
 
     def _prompt(self, prompt: str) -> str:
-        if not self.turns:
-            return prompt
-        parts, used = [], len(prompt)
-        for who, text in reversed(self.turns):
-            used += len(text) + 12
-            if used > _MAX_HISTORY_CHARS:
-                break
-            parts.append(f"{who}: {text}")
-        history = "\n\n".join(reversed(parts))
-        return ("This is a continuing conversation. Earlier turns:\n\n"
-                f"{history}\n\nNow the user writes:\n\n{prompt}")
+        return replay_prompt(self.turns, prompt)
 
     def send(self, prompt: str) -> str:
         """One turn. Raises ai_client.AiError with customer-facing words."""

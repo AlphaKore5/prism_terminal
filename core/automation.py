@@ -2740,6 +2740,40 @@ def _doc_stem(text: str, stage: str) -> str:
     return _safe_filename(stage or "document")
 
 
+def _file_tool_step(driver, stage: str, query: str, task: str, text: str,
+                    ext: str) -> dict | None:
+    """The create_file tool loop for a server step. Returns _meet_contract's
+    result shape, or None when it could not even start (so the Markdown path
+    still gets its turn)."""
+    import tempfile
+    from . import ai_client, filespec
+    out: dict = {"files": [], "texts": [], "note": "", "missing": ""}
+    try:
+        folder = tempfile.mkdtemp(prefix="prism-doc-")
+        res = filespec.run_file_tool(
+            ai_client.chat, query or task, text, max_turns=3, out_dir=folder,
+            role=getattr(driver, "role", "") or "writer",
+            addon=getattr(driver, "addon", "core"), feature="file_tool",
+            ext=ext)
+    except ai_client.AiError as e:
+        ui.warn(f"   couldn't make the file ({e})")
+        out["missing"] = str(e)
+        return out
+    except Exception as e:                                  # noqa: BLE001
+        ui.warn(f"   the file tool failed ({e})")
+        return None
+    if not res.ok:
+        ui.warn(f"   no file made: {res.message}")
+        out["missing"] = res.message
+        return out
+    out["files"] = res.files
+    out["note"] = ("Prism made this file on your computer from the AI's "
+                   "structured answer" if not res.fallback else res.message)
+    ui.ok(f"   📊  {out['note']} — "
+          + ", ".join(f["name"] for f in res.files))
+    return out
+
+
 def _meet_contract(driver, agent_cfg: dict, stage: str, kind: str,
                    texts: list, made: list, *, query: str = "",
                    task: str = "", attachments=None, should_stop=None) -> dict:
@@ -2772,6 +2806,14 @@ def _meet_contract(driver, agent_cfg: dict, stage: str, kind: str,
     ask = _c.reask(kind, ext=ext, query=query, task=task)
     if _SS.is_session(driver):
         ask = ""        # a server chat cannot attach a file; write it ourselves below
+        best_text = max((t for t in texts if (t or "").strip()), key=len, default="")
+        if kind == "file" and _c.wants_structured(ext, best_text):
+            # Spreadsheets, CSV and documents with tables: the model returns
+            # JSON through the create_file tool and Prism builds the file
+            # (core/filespec.py). Markdown below stays for plain prose.
+            tool = _file_tool_step(driver, stage, query, task, best_text, ext)
+            if tool is not None:
+                return tool
     halted = should_stop or (lambda: False)
     if (ask and driver is not None and agent_cfg.get("textarea_selector")
             and not halted()):
@@ -3224,6 +3266,13 @@ def _save_artifacts(items: list[dict], query: str, stage: str,
             continue
         item["_saved"] = saved
         ui.info(f"   💾  saved to {saved}")
+        # A file Prism built from a spec keeps the spec beside it, so a later
+        # "make it a CSV" converts the data, not the document (core/filespec).
+        if item.get("spec") and os.path.isfile(item["spec"]):
+            try:
+                shutil.copyfile(item["spec"], saved + ".spec.json")
+            except OSError:
+                pass
 
 
 # Phrases that only ever appear in what Prism types, never in a tool's answer.
