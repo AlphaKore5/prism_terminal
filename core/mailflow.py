@@ -188,7 +188,7 @@ def extract_details(message: Message, api_key: str = "", model: str = "") -> dic
     is still created from the sender and the subject, because an inquiry
     recorded imperfectly beats one that exists only in the inbox.
     """
-    if not triage.ai_ready(api_key):
+    if not api_key:
         return {}
     from .router import groq_chat
     try:
@@ -334,7 +334,7 @@ def reply_intent(message: Message, api_key: str = "", model: str = "") -> str:
     plain = local_intent(message)
     if plain:
         return plain
-    if not triage.ai_ready(api_key):
+    if not api_key:
         return UNCLEAR
     from .router import groq_chat
     try:
@@ -623,9 +623,7 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
     # correspondence out — a privacy switch that quietly did two thirds of
     # what its name promises is worse than not offering one.
     if local_only:
-        # None, not "": with AI through Prism's server an empty key still
-        # means "AI available" (triage.ai_ready); None is the switch's "never".
-        api_key = None
+        api_key = ""
     knowledge = knowledge or triage.Knowledge()
     out = Result(state=state or State(), knowledge=knowledge)
 

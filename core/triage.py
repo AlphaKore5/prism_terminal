@@ -356,23 +356,6 @@ def parse_answers(text: str, count: int) -> dict[int, str]:
     return out
 
 
-def ai_ready(api_key: str = "") -> bool:
-    """Can mail be shown to an AI? Through Prism's server (core.ai_client;
-    every customer build, no key of their own: groq_chat sends the call
-    there and ignores the key) or the old direct way with a Groq key.
-    Checking only the key made every customer's inbox "unsorted" with no
-    inquiry registered (19 Nov 2026). local_only is decided by the caller."""
-    if api_key is None:
-        return False            # "keep everything on this computer" (mailflow.check)
-    if api_key:
-        return True
-    try:
-        from . import ai_client
-        return bool(ai_client.active())
-    except Exception:                                   # noqa: BLE001
-        return False
-
-
 def classify(messages: list[Message], api_key: str = "", *,
              knowledge: Knowledge | None = None, model: str = FAST_MODEL,
              local_only: bool = False, batch_size: int = 10) -> list[Verdict]:
@@ -398,7 +381,7 @@ def classify(messages: list[Message], api_key: str = "", *,
                   if pending else
                   f"sorting: all {len(messages)} placed by local rules — "
                   "no AI call needed")
-    if not pending or local_only or not ai_ready(api_key):
+    if not pending or local_only or not api_key:
         return verdicts
 
     from . import config as C
