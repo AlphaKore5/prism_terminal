@@ -172,10 +172,100 @@ def record_until(should_stop) -> bytes:
     return buf.getvalue()
 
 
+# ── speech to text on this computer (Whisper) ────────────────────────────────
+# Owner, 19 Nov 2026: "We can use local model whisper for speech". With AI
+# through Prism's server there is no Groq key, so dictation runs Whisper here:
+# the voice never leaves the computer and costs no credits. faster-whisper
+# (CTranslate2, CPU, int8) runs OpenAI's open Whisper "base" multilingual
+# model (Hindi, Gujarati, English ...). The model is NOT in the build: the
+# person installs it once from Settings → Components (download_local_model).
+LOCAL_MODEL = "base"
+LOCAL_MODEL_URL = "https://huggingface.co/Systran/faster-whisper-base/resolve/main/"
+LOCAL_MODEL_FILES = ("config.json", "model.bin", "tokenizer.json", "vocabulary.txt")
+LOCAL_MODEL_MB = 145
+LOCAL_NOT_INSTALLED = ("Speech to text isn't on this computer yet. Open Settings "
+                       "→ Components and install it once (about 145 MB); your "
+                       "voice then stays on this computer.")
+_local_model = None
+
+
+def local_model_dir() -> str:
+    from . import config as C
+    return os.path.join(C.CONFIG_DIR, "models", f"whisper-{LOCAL_MODEL}")
+
+
+def local_ready() -> bool:
+    """faster-whisper importable and every model file present."""
+    import importlib.util
+    if importlib.util.find_spec("faster_whisper") is None:
+        return False
+    d = local_model_dir()
+    return all(os.path.isfile(os.path.join(d, f)) for f in LOCAL_MODEL_FILES) and \
+        os.path.getsize(os.path.join(d, "model.bin")) > 10_000_000
+
+
+def download_local_model(on_progress=lambda done, total: None,
+                         cancelled=lambda: False) -> bool:
+    """Fetch the model files into local_model_dir(). Each file lands as .part
+    and is renamed only when complete. False if cancelled, raises on error."""
+    d = local_model_dir()
+    os.makedirs(d, exist_ok=True)
+    done = 0
+    total = LOCAL_MODEL_MB * 1024 * 1024
+    for name in LOCAL_MODEL_FILES:
+        final = os.path.join(d, name)
+        if os.path.isfile(final) and (name != "model.bin" or os.path.getsize(final) > 10_000_000):
+            done += os.path.getsize(final)
+            on_progress(done, total)
+            continue
+        part = final + ".part"
+        with requests.get(LOCAL_MODEL_URL + name, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(part, "wb") as f:
+                for chunk in r.iter_content(1 << 20):
+                    if cancelled():
+                        f.close()
+                        os.remove(part)
+                        return False
+                    f.write(chunk)
+                    done += len(chunk)
+                    on_progress(done, max(total, done))
+        os.replace(part, final)
+    return True
+
+
+def _local_transcribe(wav_bytes: bytes) -> tuple[str, str]:
+    global _local_model
+    import numpy as np
+    from faster_whisper import WhisperModel
+    if _local_model is None:
+        _local_model = WhisperModel(local_model_dir(), device="cpu", compute_type="int8")
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        rate, channels = wf.getframerate(), wf.getnchannels()
+        raw = wf.readframes(wf.getnframes())
+    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+    if rate != SAMPLE_RATE and len(audio):
+        n = int(len(audio) * SAMPLE_RATE / rate)
+        audio = np.interp(np.linspace(0, len(audio) - 1, n), np.arange(len(audio)), audio)
+        audio = audio.astype(np.float32)
+    # vad_filter: Whisper on silence invents words ("Thank you."); the
+    # voice-activity filter drops the silent parts first.
+    segments, info = _local_model.transcribe(audio, beam_size=1, vad_filter=True)
+    text = " ".join(seg.text.strip() for seg in segments).strip()
+    return text, (info.language or "")
+
+
 def transcribe(wav_bytes: bytes, cfg: dict) -> tuple[str, str]:
-    """Send a WAV recording to Groq Whisper. Returns (text, detected_language)."""
-    if _ai.is_server_key(cfg.get("api_key")):
-        raise RuntimeError(VOICE_UNAVAILABLE)
+    """A WAV recording to (text, detected_language). With AI through Prism's
+    server (or no key at all) Whisper runs on this computer; with the old
+    direct Groq key the recording goes to Groq Whisper as before."""
+    key = cfg.get("api_key")
+    if _ai.is_server_key(key) or not key:
+        if not local_ready():
+            raise RuntimeError(LOCAL_NOT_INSTALLED)
+        return _local_transcribe(wav_bytes)
     resp = requests.post(
         TRANSCRIBE_URL,
         headers={"Authorization": f"Bearer {cfg.get('api_key', '')}"},
