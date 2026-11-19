@@ -534,8 +534,12 @@ def write_boq_xlsx(boq: Boq, path: str) -> str:
         half = gst_pct / 2
         cgst = totals_row(f"Add: CGST @ {_pct(half)}%",
                           f"=ROUND({pretax_cell}*{half / 100},2)", _TOTAL_FILL)
+        # SGST = the whole GST, rounded once, minus CGST: the same split the
+        # Word and PDF use, so the sheet's grand total equals grand_total()
+        # and the amount in words below it. Rounding each half on its own
+        # made the sheet one paisa short (₹1,09,677.51 against .52 in words).
         sgst = totals_row(f"Add: SGST @ {_pct(half)}%",
-                          f"=ROUND({pretax_cell}*{half / 100},2)", _TOTAL_FILL)
+                          f"=ROUND({pretax_cell}*{gst_pct / 100},2)-{cgst}", _TOTAL_FILL)
         gst_terms = f"{cgst}+{sgst}"
     grand = totals_row("GRAND TOTAL",
                        f"={pretax_cell}+{gst_terms}", _GRAND_FILL)
