@@ -2555,15 +2555,8 @@ def _enlarged(shape, dia: float, new_dia: float, hole_tag: str = ""):
     boolean cut cannot do and _valid_change refuses upstream."""
     bb = shape.BoundingBox()
     span = (bb.xlen ** 2 + bb.ylen ** 2 + bb.zlen ** 2) ** 0.5 or 1.0
-    target_key = None
-    if hole_tag:
-        for h in _named_holes(shape):
-            if h["tag"] == hole_tag:
-                p = h["axis_pt"]
-                target_key = (round(float(p[0]), 1), round(float(p[1]), 1),
-                             round(float(p[2]), 1))
-                break
-    seen, cutters = set(), []
+    # Every Ø`dia` hole axis on the part, once each.
+    found: dict = {}
     for f in shape.Faces():
         if f.geomType() != "CYLINDER":
             continue
@@ -2572,20 +2565,32 @@ def _enlarged(shape, dia: float, new_dia: float, hole_tag: str = ""):
             continue
         ax = cyl.Axis()
         loc, d = ax.Location(), ax.Direction()
-        key = (round(loc.X(), 1), round(loc.Y(), 1), round(loc.Z(), 1))
-        if target_key is not None and key != target_key:
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
+        found.setdefault((round(loc.X(), 1), round(loc.Y(), 1), round(loc.Z(), 1)), (loc, d))
+    keys = list(found)
+    if hole_tag and not hole_tag.upper().startswith("G"):
+        # Two tag schemes exist: _named_holes (3D views) and, for sheet metal,
+        # _flat_named_holes (the flat-pattern drawing and the AI prompt, where
+        # Assem1's top H3 is the Ø13 hole while _named_holes' H3 is a Ø3 vent
+        # hole). A tag whose hole here is the asked size is used as it is. One
+        # that points at another size is from the other scheme: with exactly
+        # ONE Ø`dia` hole on the part there is nothing to guess; with several
+        # it refuses rather than enlarge them all (19 Nov 2026).
+        tagged = next((h for h in _named_holes(shape) if h["tag"] == hole_tag), None)
+        if tagged is not None and abs(float(tagged["dia_mm"]) - dia) <= 0.05:
+            p = tagged["axis_pt"]
+            want = (round(float(p[0]), 1), round(float(p[1]), 1), round(float(p[2]), 1))
+            keys = [k for k in keys if k == want]
+        elif len(keys) != 1:
+            keys = []
+    # A "G" tag is a drawing GROUP: every hole of that one size.
+    for k in keys:
+        loc, d = found[k]
         start = _cq.Vector(loc.X(), loc.Y(), loc.Z()) - \
             _cq.Vector(d.X(), d.Y(), d.Z()) * span
-        cutters.append(_cq.Solid.makeCylinder(
+        shape = shape.cut(_cq.Solid.makeCylinder(
             new_dia / 2, 2 * span, pnt=start,
             dir=_cq.Vector(d.X(), d.Y(), d.Z())))
-    for c in cutters:
-        shape = shape.cut(c)
-    return shape, len(seen)
+    return shape, len(keys)
 
 
 def _scaled(shape, factor: float):
@@ -2643,7 +2648,7 @@ def apply_plan(path: str, plan: dict, out_path: str) -> dict:
                     log.append(f"{which}Ø{ch['dia_mm']:g} → "
                                f"Ø{ch['new_dia_mm']:g} on {name}: "
                                f"{n} hole(s) enlarged")
-                elif ch["part"] != "all":
+                elif ch["part"] != "all" or hole_tag:
                     log.append(f"! no Ø{ch['dia_mm']:g} hole "
                                f"{f'tagged {hole_tag} ' if hole_tag else ''}"
                                f"on {name} — skipped")
@@ -2651,8 +2656,12 @@ def apply_plan(path: str, plan: dict, out_path: str) -> dict:
                 by_name[name] = _scaled(by_name[name], ch["factor"])
                 log.append(f"{name} scaled x {ch['factor']:g}")
     if not any(not line.startswith("!") for line in log):
+        # Say WHY: the skip lines were built for exactly this and then
+        # dropped, so the window could only say "nothing could be applied".
+        why = "; ".join(line.lstrip("! ") for line in log if line.startswith("!"))
         raise StepError("Nothing in the plan could be applied — "
-                        "the model was not written.")
+                        "the model was not written."
+                        + (f" ({why})" if why else ""))
     asm = _cq.Assembly()
     for name, _s in parts:
         asm.add(by_name[name], name=name)
