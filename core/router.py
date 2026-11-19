@@ -498,9 +498,18 @@ def apply_script_guardrail(routing: dict, agents: dict) -> bool:
 _VIDEO_TERMS = [
     "reel", "video", "animation", "animated", "animate", "motion graphic",
     "motion graphics", "short video", "short-form", "shorts", "tiktok",
-    "promo", "teaser", "explainer", "film", "ad film", "commercial",
+    "promo", "teaser", "explainer", "film", "ad film",
     "instagram story", "story ad",
 ]
+# "commercial" alone is NOT a video: engineering and sales customers say
+# "commercial site / building / kitchen" all day, and the bare word turned
+# every such question into a script + video pipeline (~1,600 credits,
+# 19 Nov 2026). Only the advertising sense counts: a TV / 30-second / video
+# commercial, "a commercial for ...", a commercial ad or spot.
+_AD_COMMERCIAL = re.compile(
+    r"\b(?:tv|television|video|radio|ad|advert|\d+[- ]?(?:second|sec|s))\s+commercials?\b"
+    r"|\bcommercials?\s+(?:ad|advert|spot|video|film)s?\b"
+    r"|\b(?:a|an|the|our|my)\s+commercial\s+(?:for|about|on)\b")
 # "an image for my reel", "a thumbnail for the video": the picture is the
 # deliverable, the video is only where it goes.
 _PICTURE_FOR_VIDEO = re.compile(
@@ -515,7 +524,7 @@ def is_video_request(query: str) -> bool:
     q = (query or "").lower()
     if _PICTURE_FOR_VIDEO.search(q):
         return False
-    return _mentions(q, _VIDEO_TERMS)
+    return _mentions(q, _VIDEO_TERMS) or bool(_AD_COMMERCIAL.search(q))
 
 
 def apply_video_guardrail(query: str, routing: dict, agents: dict) -> list[str]:
