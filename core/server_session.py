@@ -131,6 +131,13 @@ def replay_prompt(turns: list[tuple[str, str]], prompt: str) -> str:
             f"{history}\n\nNow the user writes:\n\n{prompt}")
 
 
+# Roles whose answer is long and structured, and the model asked once more
+# when the first one sends back nothing. The server allows this model for
+# these roles (ai_seed advanced_roles; STEP pins it the same way).
+_RETRY_ON_EMPTY = ("code", "writer", "reasoner", "vision")
+_RETRY_MODEL = "anthropic/claude-sonnet-5.5"
+
+
 class ServerSession:
     """Stands where the Selenium driver stood. One conversation per stage."""
 
@@ -162,11 +169,24 @@ class ServerSession:
         return replay_prompt(self.turns, prompt)
 
     def send(self, prompt: str) -> str:
-        """One turn. Raises ai_client.AiError with customer-facing words."""
+        """One turn. Raises ai_client.AiError with customer-facing words.
+
+        An EMPTY answer (nothing charged) is asked once more of a different
+        model: 19 Nov 2026 a reel's design stage ('code' role) came back empty
+        twice after 78 s and the whole video was lost. A long art-direction
+        brief can leave a reasoning model no room for the answer itself."""
         from . import ai_client
-        text = ai_client.chat(
-            self.role, self._prompt(prompt), addon=self.addon,
-            feature=self.feature, attachments=self.pending or None)
+        full = self._prompt(prompt)
+        try:
+            text = ai_client.chat(
+                self.role, full, addon=self.addon,
+                feature=self.feature, attachments=self.pending or None)
+        except ai_client.AiError as e:
+            if e.code != "EMPTY" or self.role not in _RETRY_ON_EMPTY:
+                raise
+            text = ai_client.chat(
+                self.role, full, addon=self.addon, feature=self.feature,
+                attachments=self.pending or None, model=_RETRY_MODEL)
         self.pending = []
         self.turns.append(("USER", prompt))
         self.turns.append(("ASSISTANT", text))

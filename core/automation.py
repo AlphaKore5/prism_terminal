@@ -6036,7 +6036,11 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
             spec = web.parse_spec(text)
             break
         except Exception as e:
-            why_bad = why_bad or e
+            # Keep the most telling reason: "No JSON found" from an earlier
+            # stage's prose (a caption, "drew 5 images") hid "the scenes carry
+            # no markup" from the one candidate that was close (19 Nov 2026).
+            if why_bad is None or "No JSON found" in str(why_bad):
+                why_bad = e
     if spec is None:
         # Keep what actually came back. Without this the one piece of evidence
         # that could explain the failure is discarded at the moment it becomes
