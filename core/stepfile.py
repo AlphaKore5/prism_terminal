@@ -2744,10 +2744,22 @@ def review_html(report: dict, plan: dict, out_dir: str,
         # Build/Cancel buttons next to it) and used to name only the
         # terminal, which confused the GUI's own confirm into looking like
         # dead instructions nothing on screen matched.
-        banner = ("<div class='banner'>Nothing is built yet. This is the "
-                  "plan for "
-                  f"{_html.escape(names(report)['modified'])} — confirm it "
-                  "to build, or stop here.</div>")
+        # Name the real button (owner, 20 Nov 2026: "it is asking for
+        # confirmation but there is no button for that" -- this page is a
+        # document, the button is under the plan in Prism). A plan with no
+        # change cannot be confirmed at all, so it says that instead.
+        if plan.get("changes"):
+            banner = ("<div class='banner'>Nothing is built yet. This is the "
+                      "plan for "
+                      f"{_html.escape(names(report)['modified'])}. To build it, "
+                      "press <b>Build the modified model</b> under the plan in "
+                      "Prism's STEP screen (or answer Y in the terminal); "
+                      "<b>Not now</b> stops here.</div>")
+        else:
+            banner = ("<div class='banner'>Nothing will be built: Prism found "
+                      "no change it can make from this request. The notes "
+                      "below say what it needs — say it and press "
+                      "<b>Make a change</b> again.</div>")
 
     def fmt(size):
         return f"{size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f}"
