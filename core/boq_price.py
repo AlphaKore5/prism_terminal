@@ -76,6 +76,13 @@ def _area_unit(drawing_unit: str) -> str:
     return _AREA_UNIT.get((drawing_unit or "").strip().lower(), "sq-unit")
 
 
+# Rates are quoted per metre / per square metre (IS 1200), never per mm. A
+# metric drawing measured in mm or cm is converted to m / sqm when the BOQ
+# lines are built, so a rate typed or matched per metre prices the line
+# correctly instead of 1000x high. Other units (m, ft, in) are left as drawn.
+_METRES_PER_UNIT = {"millimeters": Decimal("0.001"), "centimeters": Decimal("0.01")}
+
+
 # ── the priced document model ─────────────────────────────────────────────────
 
 @dataclass
@@ -202,10 +209,17 @@ def boq_from_measured(q: dict, mapping: dict | None = None,
             _apply_confident_rate(it, rate_items)
         items.append(it)
 
+    to_m = _METRES_PER_UNIT.get((unit or "").strip().lower())
     for name, length in (q.get("lengths_by_layer") or {}).items():
-        build(name, length, _length_unit(unit), "length")
+        if to_m:
+            build(name, quoting.to_decimal(length) * to_m, "m", "length")
+        else:
+            build(name, length, _length_unit(unit), "length")
     for name, area in (q.get("areas_by_layer") or {}).items():
-        build(name, area, _area_unit(unit), "area")
+        if to_m:
+            build(name, quoting.to_decimal(area) * to_m * to_m, "sqm", "area")
+        else:
+            build(name, area, _area_unit(unit), "area")
     for name, count in (q.get("block_counts") or {}).items():
         build(name, count, "nos", "count")
 
