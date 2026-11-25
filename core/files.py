@@ -373,6 +373,27 @@ def context_block(attachments: list[dict], uploaded: bool = False) -> str:
         elif text:
             trunc = "  [content truncated]" if att.get("truncated") else ""
             parts.append(f"{header}{trunc}\n{text}\n")
+        elif profile:
+            # item 46 (3 Nov 2026), found live: a real client reference BOQ
+            # (.xlsx, 14 rows) attached alongside a drawing was described to
+            # the model as "binary file -- uploaded directly to the tool;
+            # contents not inlined" -- false for this call site
+            # (core_bridge's Prism-Agent path never passes uploaded=True,
+            # nothing is actually uploaded here), and the model reported,
+            # correctly given what it was told, that it could not read the
+            # file. The real bug: a spreadsheet's `profile` -- this
+            # function's own docstring says "for a spreadsheet, gives the
+            # profile" -- was only ever shown above the `big_table`
+            # threshold (> PROFILE_ABOVE_ROWS, 40). A SMALL spreadsheet
+            # format with no `text` field at any size (.xlsx -- unlike
+            # .csv/.txt, _extract_text() never populates one for it) fell
+            # through `big_table` (too few rows) AND `elif text` (none) to
+            # the same "not inlined" message a genuinely unreadable binary
+            # gets, even though its profile was computed and correct. A
+            # small table that already has real `text` (a small .csv) is
+            # unaffected -- it still hits `elif text:` above and gets
+            # pasted whole, unchanged from before this fix.
+            parts.append(f"{header}  [spreadsheet]\n{profile}\n")
         else:
             parts.append(f"{header}\n(binary file — uploaded directly to the tool; contents not inlined)\n")
     parts.append("── end of attachments ──\n")

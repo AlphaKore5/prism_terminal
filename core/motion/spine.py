@@ -173,13 +173,50 @@ def storyboard_text(n_scenes: int) -> str:
               "this one.")
 
 
-def recipe_text(name: str) -> str:
+# The recipes are a reference film's, colours included: a sky-blue gradient, a
+# blue chat bubble, a blue-white tree, bokeh in "orange, purple, blue, gold". The
+# writer copies the hex it is given, so a film in a dark red "night" direction
+# came out with a flat #3d5c94 blue scene in the middle (13 Nov 2026, round 3):
+# the art direction and the client's colours lost to the example. A recipe is
+# therefore given in the film's own palette.
+_SKY_RADIAL = ("radial-gradient(circle at 50% 50%, #8fb4d6 0%, #86accf 12%, #7aa2cb 30%, #6f96c2 55%, "
+               "#6288b8 80%, #5479ab 100%)")
+_SKY_LINEAR = ("linear-gradient(115deg, #3d5c94 0%, #6b90c2 25%, #8fb2d8 42%, #98b9dc 58%, "
+               "#6f95c6 78%, #4a6ba4 100%)")
+
+
+def _recolour(text: str, palette: Optional[Dict[str, Any]]) -> str:
+    """`text` with the reference's blues swapped for the film's palette (bg_a, bg_b, accent,
+    accent2). Unchanged when the palette does not name those four."""
+    p = palette if isinstance(palette, dict) else {}
+    bg_a, bg_b, accent, accent2 = (str(p.get(k) or "") for k in ("bg_a", "bg_b", "accent", "accent2"))
+    if not (bg_a and bg_b and accent):
+        return text
+    accent2 = accent2 or accent
+    for old, new in (
+            (_SKY_RADIAL, f"radial-gradient(circle at 50% 50%, {bg_b} 0%, {bg_a} 100%)"),
+            (_SKY_LINEAR, f"linear-gradient(115deg, {bg_a} 0%, {bg_b} 50%, {bg_a} 100%)"),
+            ("#2563FF", accent),
+            ("rgba(140,200,255,0.95)", accent),
+            ("a small violet light_field", f"a small {accent2} light_field"),
+            ("(orange, purple, blue, gold; ", f"({accent}, {accent2} and tints of the ground; "),
+            ("a faint grey light_field haze", f"a faint {bg_b} light_field haze"),
+            ("a blue light_field glow", f"a {accent2} light_field glow"),
+            ("a bright sky sweeps in", "a field of the ground colour sweeps in"),
+            ("over the bright sky", "over the ground colour"),
+            ("it MUST be bright by 0.5 s", "it MUST be fully in by 0.5 s")):
+        text = text.replace(old, new)
+    return text
+
+
+def recipe_text(name: str, palette: Optional[Dict[str, Any]] = None) -> str:
     b = beat(name)
     if not b:
         return ""
-    return (f'THIS SCENE\'S BEAT: "{name}" — {b["subject"]}.\nBUILD IT LIKE THIS (the numbers '
-            f"are the reference's, in 1080x1920; keep them unless the copy needs a nudge): "
-            f"{b['recipe']}.\nA scene without this beat's primitives and phases is sent back.")
+    return _recolour(
+        f'THIS SCENE\'S BEAT: "{name}" — {b["subject"]}.\nBUILD IT LIKE THIS (the numbers '
+        f"are the reference's, in 1080x1920; keep them unless the copy needs a nudge): "
+        f"{b['recipe']}.\nA scene without this beat's primitives and phases is sent back.", palette)
 
 
 # ── the check ────────────────────────────────────────────────────────────────

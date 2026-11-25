@@ -20,24 +20,36 @@ walks LINE/LWPOLYLINE/POLYLINE geometry, and add to it, in its own shape,
 the next time a real client file finds another one.
 
 .dwg is a proprietary binary format ezdxf cannot read directly. It must be
-converted to .dxf (an open, documented format) FIRST, on the user's own
-machine, with one of:
+converted to .dxf (an open, documented format) FIRST, with one of:
 
-  • GNU LibreDWG (free, scriptable, recommended):
-        macOS   →  brew install libredwg          (gives the `dwg2dxf` CLI)
-        Linux   →  build LibreDWG from source (many current Debian/Ubuntu
-                    repositories do not package the `dwg2dxf` utility)
+  • Prism's own bundled `dwg2dxf` (GNU LibreDWG) — on an Apple Silicon Mac or
+    64-bit Windows, nothing to install: _ensure_bundled_dwg2dxf() copies it
+    into ~/.prism/tools/dwg2dxf/ the first time a .dwg is opened, and
+    find_dwg_converter() finds it there on every run after. See
+    core/vendor/dwg2dxf/README.md for exactly what's bundled, where it came
+    from, and a real failure mode found while verifying it (read that before
+    touching the validation in dwg_to_dxf() below — it is load-bearing).
     Coverage of newer/exotic DWG features is not perfect — good enough for
     ordinary 2D architectural drawings, which is the common case here.
 
-  • ODA File Converter (free, more complete, GUI-first but scriptable):
+  • GNU LibreDWG, installed by hand, on platforms Prism has no bundled copy
+    for (an Intel Mac, Linux, 32-bit Windows):
+        macOS   →  brew install libredwg          (gives the `dwg2dxf` CLI)
+        Linux   →  build LibreDWG from source (many current Debian/Ubuntu
+                    repositories do not package the `dwg2dxf` utility)
+
+  • ODA File Converter (free, more complete, GUI-first but scriptable),
+    always honoured first if it's already installed — more reliable than
+    dwg2dxf (full DWG spec, not a reverse-engineered reader) and worth
+    recommending to a customer who hits real conversion problems:
         https://www.opendesign.com/guestfiles/oda_file_converter
     On Windows it installs under %ProgramFiles%\\ODA\\ODAFileConverter*\\ and
     does NOT add itself to PATH — find_dwg_converter() globs that location, so
     no PATH surgery is needed there. On Linux, put `ODAFileConverter` on PATH.
 
-ensure_dxf() detects whichever is installed; if neither is, it raises a clear
-error naming both options rather than failing obscurely.
+ensure_dxf() detects whichever is available (bundled dwg2dxf counts); if
+none is, it raises a clear error naming the install options rather than
+failing obscurely.
 
 KNOWN LIMITATIONS (disclosed, not hidden):
   • Curved polyline segments (bulges) are measured exactly for LWPOLYLINE;
@@ -64,8 +76,6 @@ import tempfile
 
 from . import skills as _SK
 
-_CONVERTER_CANDIDATES = ["dwg2dxf", "ODAFileConverter", "ODAFileConverter.exe"]
-
 # An explicit path, for anyone who has a reason — same escape hatch
 # core/ffmpeg.py offers as PRISM_FFMPEG.
 ENV_CONVERTER = "PRISM_DWG_CONVERTER"
@@ -82,7 +92,90 @@ class BoqError(Exception):
     pass
 
 
+# The first sentence of the "no converter" message. The GUI looks for it to open
+# its own "install the converter" window instead of a plain message box.
+NO_CONVERTER_TEXT = ("Prism needs a free helper program to open a DWG drawing, "
+                     "and this computer does not have it yet.")
+
+
+class NoConverterError(BoqError):
+    """A .dwg was given and no DWG→DXF converter is installed or chosen."""
+
+
 # ── DWG → DXF ──────────────────────────────────────────────────────────────
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _dwg2dxf_platform_tag() -> str | None:
+    """Vendor subfolder name (under core/vendor/dwg2dxf/) for this machine,
+    or None if Prism carries no bundled dwg2dxf for it — those machines fall
+    through to PATH / a manual install exactly as before this existed. See
+    core/vendor/dwg2dxf/README.md for what's bundled and why only these two."""
+    system = platform.system()
+    machine = platform.machine().lower()
+    if system == "Darwin" and machine in ("arm64", "aarch64"):
+        return "macos-arm64"
+    # Windows on ARM runs the x64 build through its own emulation (Windows 11),
+    # and LibreDWG publishes no ARM build, so ARM64 uses the same files.
+    if system == "Windows" and machine in ("amd64", "x86_64", "arm64", "aarch64"):
+        return "win64"
+    return None
+
+
+#: Why Prism's own converter could not be set up on this machine, or "". It was swallowed silently
+#: before, so a person was told "no converter found" with no hint that one was bundled and failed
+#: to install (antivirus, a read-only folder, a build without the files).
+BUNDLED_PROBLEM = ""
+
+
+def _ensure_bundled_dwg2dxf() -> None:
+    """Install Prism's own bundled dwg2dxf into ~/.prism/tools/dwg2dxf/<tag>/
+    the first time it's needed, so find_dwg_converter()'s existing tools-dir
+    scan (below) picks it up with no other change to this file. A cheap
+    no-op once it's there. Never raises — a failed install just means the
+    tools-dir glob finds nothing new and the search falls through to PATH /
+    an installed converter / "please install one", same as before this
+    function existed."""
+    global BUNDLED_PROBLEM
+    BUNDLED_PROBLEM = ""
+    tag = _dwg2dxf_platform_tag()
+    if not tag:
+        BUNDLED_PROBLEM = (f"Prism has no built-in converter for this computer "
+                           f"({platform.system()} {platform.machine()}).")
+        return
+    exe_name = "dwg2dxf.exe" if tag.startswith("win") else "dwg2dxf"
+    src_dir = os.path.join(_HERE, "vendor", "dwg2dxf", tag)
+    src_exe = os.path.join(src_dir, exe_name)
+    if not os.path.isfile(src_exe):
+        BUNDLED_PROBLEM = "Prism's built-in converter is missing from this copy of Prism."
+        return  # this checkout/build doesn't carry a vendor copy
+
+    try:
+        from . import ffmpeg as _ffmpeg
+        dst_dir = os.path.join(_ffmpeg.tools_dir(), "dwg2dxf", tag)
+    except Exception:
+        return
+    dst_exe = os.path.join(dst_dir, exe_name)
+
+    # Already installed, same size as the one we ship: nothing to do. Not a
+    # hash check — this runs on every find_dwg_converter() call, and a
+    # cross-platform stat is cheap where re-hashing a bundled DLL set is not.
+    if (os.path.isfile(dst_exe)
+            and os.path.getsize(dst_exe) == os.path.getsize(src_exe)):
+        return
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+        for name in os.listdir(src_dir):
+            if name == "README.md":
+                continue
+            shutil.copy2(os.path.join(src_dir, name), os.path.join(dst_dir, name))
+        os.chmod(dst_exe, 0o755)  # PyInstaller's own datas don't promise the +x bit survives
+    except OSError as e:
+        # Not fatal, but say why: security software removing or locking the file shows up here.
+        BUNDLED_PROBLEM = (f"Prism's built-in converter could not be set up in {dst_dir} ({e}). "
+                           "Security software may be blocking it.")
+
 
 def _installed_converter_paths() -> list[str]:
     """Where a DWG converter actually lands when somebody installs one.
@@ -109,11 +202,15 @@ def _installed_converter_paths() -> list[str]:
     found: list[str] = []
 
     if system == "Windows":
-        for var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
-                    "LOCALAPPDATA"):
-            root = os.environ.get(var)
-            if not root:
+        roots = [os.environ.get(var) for var in (
+            "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "LOCALAPPDATA")]
+        # The usual folders even when the environment does not name them.
+        roots += ["C:\\Program Files", "C:\\Program Files (x86)"]
+        seen_roots: set = set()
+        for root in roots:
+            if not root or root.lower() in seen_roots:
                 continue
+            seen_roots.add(root.lower())
             # The folder carries the version, so it has to be matched
             # rather than named: ODAFileConverter 25.4.0, 26.2.0, and so on.
             #
@@ -136,6 +233,8 @@ def _installed_converter_paths() -> list[str]:
             "/Applications/ODAFileConverter.app/Contents/MacOS/ODAFileConverter",
             os.path.expanduser("~/Applications/ODAFileConverter.app/Contents/"
                                "MacOS/ODAFileConverter"),
+            *sorted(glob.glob("/Applications/ODAFileConverter*.app/Contents/"
+                              "MacOS/ODAFileConverter")),
             "/opt/homebrew/bin/dwg2dxf",     # Apple Silicon Homebrew
             "/usr/local/bin/dwg2dxf",        # Intel Homebrew
         ]
@@ -143,6 +242,13 @@ def _installed_converter_paths() -> list[str]:
         found += [
             "/usr/bin/ODAFileConverter",
             "/usr/local/bin/ODAFileConverter",
+            # the .deb/.rpm unpack into /opt; an AppImage sits wherever it was saved
+            *sorted(glob.glob("/opt/ODAFileConverter*/ODAFileConverter")),
+            *sorted(glob.glob(os.path.expanduser(
+                "~/Applications/ODAFileConverter*.AppImage"))),
+            *sorted(glob.glob(os.path.expanduser(
+                "~/Downloads/ODAFileConverter*.AppImage"))),
+            *sorted(glob.glob(os.path.expanduser("~/ODAFileConverter*.AppImage"))),
             "/usr/bin/dwg2dxf",
             "/usr/local/bin/dwg2dxf",
         ]
@@ -175,9 +281,20 @@ def _oda_version_key(exe_path: str) -> tuple[int, int, int]:
 def find_dwg_converter() -> str | None:
     """The DWG→DXF converter this machine should use, or None.
 
-    Four places, in the order core/ffmpeg.py already established for FFmpeg:
-    an explicit override, Prism's own tools directory, PATH, and then the
-    places an installer actually puts these — see _installed_converter_paths.
+    ODA File Converter is preferred over dwg2dxf at every stage below — it
+    reads the full DWG spec; dwg2dxf is a reverse-engineered reader that can
+    fail on newer/exotic DWG features (see core/vendor/dwg2dxf/README.md for
+    a real example). So each stage checks ODA's names before dwg2dxf's name,
+    and Prism's own bundled dwg2dxf — installed on first use, see
+    _ensure_bundled_dwg2dxf — is tried dead last, only once every other
+    possibility (an explicit override, anything already on this machine) has
+    come up empty. A customer who installed ODA themselves always gets it;
+    Prism's bundled copy exists for the machines that have nothing at all.
+
+    The places, in the order core/ffmpeg.py already established for FFmpeg:
+    an explicit override, Prism's own tools directory, PATH, the places an
+    installer actually puts these (_installed_converter_paths), and finally
+    Prism's own bundled copy.
 
     Prism's own tools folder is searched BEFORE PATH on purpose: a binary
     somebody placed there deliberately should beat whatever PATH happens to
@@ -189,8 +306,11 @@ def find_dwg_converter() -> str | None:
         return override
 
     # ~/.prism/tools/** — the same directory FFmpeg is fetched into, so a
-    # converter dropped there is found with no PATH change, on any OS. Reached
-    # before PATH, and cheap: a small tree, walked once.
+    # converter dropped there (by a user, or by _ensure_bundled_dwg2dxf
+    # below on an earlier call) is found with no PATH change, on any OS.
+    # Reached before PATH, and cheap: a small tree, walked once. ODA's own
+    # names come first in the glob so a user-dropped ODA always beats a
+    # user-dropped (or Prism-installed) dwg2dxf sitting in the same folder.
     try:
         from . import ffmpeg as _ffmpeg
         tools = _ffmpeg.tools_dir()
@@ -198,27 +318,41 @@ def find_dwg_converter() -> str | None:
         tools = ""
     if tools and os.path.isdir(tools):
         import glob
-        for name in ("dwg2dxf.exe", "dwg2dxf",
-                     "ODAFileConverter.exe", "ODAFileConverter"):
+        for name in ("ODAFileConverter.exe", "ODAFileConverter",
+                     "dwg2dxf.exe", "dwg2dxf"):
             for hit in sorted(glob.glob(os.path.join(tools, "**", name),
                                         recursive=True)):
                 if os.path.isfile(hit):
                     return hit
 
-    # Anything actually on PATH — `dwg2dxf` on macOS/Linux, or an
-    # ODAFileConverter a user deliberately PATH-added. shutil.which() honours
-    # PATHEXT on Windows, so the bare name already covers the .exe.
-    for name in _CONVERTER_CANDIDATES:
+    # Anything actually on PATH — an ODAFileConverter a user deliberately
+    # PATH-added, or `dwg2dxf` on macOS/Linux. shutil.which() honours
+    # PATHEXT on Windows, so the bare name already covers the .exe. ODA's
+    # names checked first, same reasoning as the glob above.
+    for name in ("ODAFileConverter", "ODAFileConverter.exe", "dwg2dxf"):
         found = shutil.which(name)
         if found:
             return found
 
-    # Last: where an installer actually puts these. ODA's Windows installer
-    # adds nothing to PATH, and Homebrew's bin is absent from the environment
-    # a Finder-launched .app inherits — both are "installed, and invisible".
+    # Where an installer actually puts these. ODA's Windows installer adds
+    # nothing to PATH, and Homebrew's bin is absent from the environment a
+    # Finder-launched .app inherits — both are "installed, and invisible".
     for path in _installed_converter_paths():
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
+
+    # Last resort: Prism's own bundled dwg2dxf (Apple Silicon Mac / 64-bit
+    # Windows only — see _dwg2dxf_platform_tag). Installed here, not at the
+    # top of this function, specifically so it never pre-empts a real ODA
+    # install found above.
+    _ensure_bundled_dwg2dxf()
+    if tools and os.path.isdir(tools):
+        import glob
+        for name in ("dwg2dxf.exe", "dwg2dxf"):
+            for hit in sorted(glob.glob(os.path.join(tools, "dwg2dxf", "**", name),
+                                        recursive=True)):
+                if os.path.isfile(hit):
+                    return hit
     return None
 
 def _read_dxf(path: str):
@@ -284,27 +418,11 @@ def dwg_to_dxf(dwg_path: str, out_dir: str | None = None) -> tuple[str, list[str
         # all was Windows, which is most of the customers this add-on is sold
         # to. ODA File Converter is free, has a Windows installer, and is the
         # answer on all three.
-        system = platform.system()
-        if system == "Windows":
-            how = ("  • ODA File Converter (free, Windows installer):\n"
-                   "    https://www.opendesign.com/guestfiles/oda_file_converter\n"
-                   "    Prism finds it automatically in its default install "
-                   "location afterwards — no PATH change needed. (Installed it "
-                   "somewhere custom? Add that folder to PATH.)\n")
-        elif system == "Darwin":
-            how = ("  • brew install libredwg     (gives the `dwg2dxf` tool)\n"
-                   "  • or ODA File Converter (free):\n"
-                   "    https://www.opendesign.com/guestfiles/oda_file_converter\n")
-        else:
-            how = ("  • ODA File Converter (free, .deb/.rpm — the simplest "
-                   "supported option):\n"
-                   "    https://www.opendesign.com/guestfiles/oda_file_converter\n"
-                   "    (or build LibreDWG from source to get `dwg2dxf`)\n")
-        raise BoqError(
-            "No DWG→DXF converter found on this machine. Install one:\n"
-            + how +
-            "Then re-run /boq — or convert it yourself and attach the .dxf directly."
-        )
+        raise NoConverterError(
+            NO_CONVERTER_TEXT + "\n"
+            + (BUNDLED_PROBLEM + "\n" if BUNDLED_PROBLEM else "")
+            + "Get it here (free): https://www.opendesign.com/guestfiles/oda_file_converter\n"
+            "Or save the drawing as a DXF file and attach that instead.")
     out_dir = out_dir or tempfile.mkdtemp(prefix="prism_boq_")
     name = os.path.splitext(os.path.basename(dwg_path))[0]
     out_path = os.path.join(out_dir, f"{name}.dxf")
@@ -368,6 +486,14 @@ def dwg_to_dxf(dwg_path: str, out_dir: str | None = None) -> tuple[str, list[str
         # conversion, and on macOS/Linux this stays the old call unchanged
         # (startupinfo=None, creationflags=0).
         run_kwargs: dict = {}
+        # ODA is a Qt program with its own Qt. Prism is a Qt program too, and its
+        # Qt settings (QT_QPA_PLATFORM, QT_PLUGIN_PATH, QML2_IMPORT_PATH...) are
+        # inherited by anything it launches. Handed those, ODA looks for its
+        # platform plugin in Prism's Qt and dies ("Could not find the Qt platform
+        # plugin", exit 134 -- seen here on Linux with QT_QPA_PLATFORM=offscreen).
+        # So ODA gets the environment without any Qt variable.
+        run_kwargs["env"] = {k: v for k, v in os.environ.items()
+                             if not k.upper().startswith("QT_") and k.upper() != "QML2_IMPORT_PATH"}
         if os.name == "nt":
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -528,34 +654,52 @@ def _hatch_area(e) -> float:
 # AI's own direct read of the same drawing, 38.80 m: a client's real file, not
 # a corner case built to test with.
 
-def _collapse_duct_pairs(segments: list) -> tuple[float, int]:
-    """The route length of one layer's straight LINE segments, treating a
-    matched pair of near-parallel, near-equal-length lines a small constant
-    distance apart as ONE run (its two edges), not two — and dropping the
-    short perpendicular stub that closes the open end of a paired run, which
-    is not route length at all, just the drawing closing the rectangle.
+def _unit_dir(a, b, length: float | None = None) -> tuple[float, float]:
+    length = _dist(a, b) if length is None else length
+    if length <= 0:
+        return (0.0, 0.0)
+    return ((b[0] - a[0]) / length, (b[1] - a[1]) / length)
 
-    A line with no match is kept at its own full, un-halved length — this
-    only ever acts on a genuine double-line pair; an ordinary single-line
-    (centreline/schematic) run, on its own layer, is untouched. Two SEPARATE
-    same-length parallel runs (e.g. a flow pipe and a return pipe) are safe
-    by construction as long as the drawing keeps them on separate layers,
-    which is the normal convention this whole module already relies on
-    elsewhere — this function only ever compares lines within ONE layer's
-    own list, never across layers.
 
-    Returns (total_length, pairs_found) — the caller turns a non-zero
-    `pairs_found` into a visible note, never a silent correction: this is a
-    geometric inference, not a measurement, and the module's whole promise
-    is that nothing here is silently trusted."""
+def _duct_runs(segments: list) -> list[dict]:
+    """One layer's straight LINE segments, resolved into real runs —
+    {"a", "b", "length", "offset", "kind"} each, `kind` one of:
+
+      "pair"       a matched double-line edge pair (rule 1): near-parallel,
+                   near-equal-length, a small constant distance apart —
+                   counted once, at the average of its two edges.
+      "transition" a tapering reducer between two different-width pairs
+                   (rule 2, added 23 Oct 2026, found on the same real file
+                   rule 1 came from: a reducer is drawn as two short lines
+                   that CONVERGE, not run parallel, so rule 1's own pairing
+                   correctly leaves them unmatched — but counting both
+                   diagonals in full double-counts the transition by about
+                   its own length. Detected the same way a pair's own
+                   offset is validated: both ends sit a plausible duct-width
+                   apart (20-2000 mm), just a DIFFERENT width at each end —
+                   that difference is what makes it a transition and not a
+                   pair — and the transition itself is no longer than the
+                   widest confirmed pair on the layer, so an unrelated long
+                   diagonal line elsewhere can never be mistaken for one.
+      "single"     no match — an ordinary single-line (centreline/
+                   schematic) run, counted at its own full length, exactly
+                   as before rule 1 ever existed.
+      "bridged"    two collinear, same-width "pair" runs with a small gap
+                   between them, joined into one continuous run (rule 2's
+                   gap-bridging, revisited with real topology — see below).
+
+    A short perpendicular stub that closes a pair's open end (not route
+    length, just the drawing closing the rectangle) is dropped entirely —
+    it appears in none of the kinds above.
+
+    Two SEPARATE same-length parallel runs (e.g. a flow pipe and a return
+    pipe) are safe by construction as long as the drawing keeps them on
+    separate layers, which is the normal convention this whole module
+    already relies on elsewhere — this function only ever compares lines
+    within ONE layer's own list, never across layers."""
     n = len(segments)
     lengths = [_dist(a, b) for a, b in segments]
-    dirs = []
-    for (a, b), length in zip(segments, lengths):
-        if length <= 0:
-            dirs.append((0.0, 0.0))
-            continue
-        dirs.append(((b[0] - a[0]) / length, (b[1] - a[1]) / length))
+    dirs = [_unit_dir(a, b, length) for (a, b), length in zip(segments, lengths)]
 
     used = [False] * n
     pairs: list[tuple[int, int, float]] = []
@@ -592,7 +736,11 @@ def _collapse_duct_pairs(segments: list) -> tuple[float, int]:
             used[i] = used[j] = True
             pairs.append((i, j, off))
 
-    total = sum((lengths[i] + lengths[j]) / 2 for i, j, _off in pairs)
+    runs: list[dict] = []
+    for i, j, off in pairs:
+        a, b = segments[i]
+        runs.append({"a": a, "b": b, "length": (lengths[i] + lengths[j]) / 2,
+                    "offset": off, "kind": "pair", "seg_idxs": (i, j)})
 
     for k in range(n):
         if used[k] or lengths[k] <= 0:
@@ -607,10 +755,307 @@ def _collapse_duct_pairs(segments: list) -> tuple[float, int]:
                 break
         if is_cap:
             used[k] = True
-            continue
-        total += lengths[k]
 
-    return total, len(pairs)
+    # rule 2: a tapering transition's two converging sides, counted once.
+    leftover = [k for k in range(n) if not used[k] and lengths[k] > 0]
+    widest_pair = max((r["length"] for r in runs), default=0.0)
+    for a_i in range(len(leftover)):
+        i = leftover[a_i]
+        if used[i]:
+            continue
+        for b_i in range(a_i + 1, len(leftover)):
+            j = leftover[b_i]
+            if used[j]:
+                continue
+            cross = abs(dirs[i][0] * dirs[j][1] - dirs[i][1] * dirs[j][0])
+            if cross <= 0.05:
+                continue                      # parallel -- rule 1 already owns this
+            if abs(lengths[i] - lengths[j]) > 0.08 * max(lengths[i], lengths[j]):
+                continue
+            start_gap = _dist(segments[i][0], segments[j][0])
+            end_gap = _dist(segments[i][1], segments[j][1])
+            if not (20.0 <= start_gap <= 2000.0 and 20.0 <= end_gap <= 2000.0):
+                continue
+            if widest_pair and max(lengths[i], lengths[j]) > widest_pair:
+                continue                      # longer than any confirmed duct width -- not a transition
+            used[i] = used[j] = True
+            runs.append({"a": segments[i][0], "b": segments[j][1],
+                        "length": (lengths[i] + lengths[j]) / 2, "offset": None,
+                        "kind": "transition"})
+            break
+
+    for k in range(n):
+        if used[k] or lengths[k] <= 0:
+            continue
+        a, b = segments[k]
+        runs.append({"a": a, "b": b, "length": lengths[k], "offset": None, "kind": "single"})
+        used[k] = True
+
+    # rule 2 revisited, 25 Oct 2026: bridge a small gap between two
+    # collinear, same-width "pair" runs into one continuous run — UNLESS
+    # some OTHER segment on this same layer has an endpoint landing inside
+    # that gap, which means a branch ties into the trunk exactly there (a
+    # tee/cross junction, not a break in an otherwise continuous run).
+    #
+    # The original version of this idea bridged every such gap and was
+    # rejected before shipping: on a real file, a trunk that takes
+    # branches off BOTH sides at the same point reads as one continuous
+    # run straight through its own body, silently adding the trunk's own
+    # width (400-800mm per occurrence there) as if it were missing duct.
+    # This version adds the real topology check that was missing — found
+    # by reproducing that exact file (`hvac_tender_complex.dxf`,
+    # M-DUCT-SUPPLY): every real gap in it has a crossing branch's
+    # endpoint landing exactly inside the gap (confirmed at (13275, 16400)
+    # and (13725, 15600), where two branches cross the trunk from opposite
+    # sides at the same point) — so this check correctly leaves all of
+    # them un-bridged, same as before this rule existed. A gap with
+    # nothing tied into it — a trunk split into two LINE entities for no
+    # topological reason — is bridged.
+    def _axis(r):
+        (ax, ay), (bx, by) = r["a"], r["b"]
+        if abs(ay - by) < 1.0:
+            return ("H", round(ay, 1))
+        if abs(ax - bx) < 1.0:
+            return ("V", round(ax, 1))
+        return None
+
+    bridged_away: set[int] = set()
+    pair_idxs = [idx for idx, r in enumerate(runs) if r["kind"] == "pair"]
+    for a_i in range(len(pair_idxs)):
+        i_idx = pair_idxs[a_i]
+        if i_idx in bridged_away:
+            continue
+        ri = runs[i_idx]
+        axi = _axis(ri)
+        if not axi:
+            continue
+        for b_i in range(len(pair_idxs)):
+            j_idx = pair_idxs[b_i]
+            if j_idx == i_idx or j_idx in bridged_away:
+                continue
+            rj = runs[j_idx]
+            if _axis(rj) != axi:
+                continue
+            if abs(ri["offset"] - rj["offset"]) > 5.0:
+                continue
+            dim = 0 if axi[0] == "H" else 1
+            a1, b1 = sorted((ri["a"][dim], ri["b"][dim]))
+            a2, b2 = sorted((rj["a"][dim], rj["b"][dim]))
+            if b1 >= a2:
+                continue                       # rj is not to the "right" of ri
+            gap = a2 - b1
+            if not (1.0 < gap < 2000.0):
+                continue
+            y0 = axi[1]
+            band = max(ri["offset"], rj["offset"], 5.0)
+            # ri/rj's OWN boundary endpoints sit exactly at the gap's own
+            # edges (b1, a2) -- excluded by raw segment index, not by
+            # coordinate, because a genuine crossing branch can legitimately
+            # land exactly on one of those same coordinates (confirmed on
+            # the real file: the branch ties in exactly at the trunk pair's
+            # own endpoint, not a little inside it).
+            own = set(ri.get("seg_idxs", ())) | set(rj.get("seg_idxs", ()))
+            branched = False
+            for s_idx, (sa, sb) in enumerate(segments):
+                if s_idx in own:
+                    continue
+                for pt in (sa, sb):
+                    if (b1 - 1.0 <= pt[dim] <= a2 + 1.0
+                            and abs(pt[1 - dim] - y0) < band):
+                        branched = True
+                        break
+                if branched:
+                    break
+            if branched:
+                continue                       # a real junction -- do not bridge
+            pts = sorted((ri["a"], ri["b"], rj["a"], rj["b"]),
+                        key=lambda p: p[dim])
+            runs[i_idx] = {"a": pts[0], "b": pts[-1],
+                          "length": ri["length"] + gap + rj["length"],
+                          "offset": (ri["offset"] + rj["offset"]) / 2,
+                          "kind": "bridged", "seg_idxs": tuple(own)}
+            bridged_away.add(j_idx)
+            ri = runs[i_idx]
+            break
+
+    if bridged_away:
+        runs = [r for idx, r in enumerate(runs) if idx not in bridged_away]
+
+    return runs
+
+
+def _collapse_duct_pairs(segments: list) -> tuple[float, int, int, int]:
+    """Thin wrapper over `_duct_runs()`: the route length of one layer's
+    straight LINE segments, plus how many genuine pairs, tapering
+    transitions and bridged branch-take-off gaps were found -- the caller
+    turns each into a visible note, never a silent correction: these are
+    geometric inferences, not measurements, and the module's whole promise
+    is that nothing here is silently trusted.
+
+    Returns (total_length, pairs_found, transitions_found, bridged_found)."""
+    runs = _duct_runs(segments)
+    total = sum(r["length"] for r in runs)
+    pairs_found = sum(1 for r in runs if r["kind"] == "pair")
+    transitions_found = sum(1 for r in runs if r["kind"] == "transition")
+    bridged_found = sum(1 for r in runs if r["kind"] == "bridged")
+    return total, pairs_found, transitions_found, bridged_found
+
+
+# ── rule 3: duct/pipe sizes from the drawing's own TEXT labels ─────────────
+# Found testing the duct-pairing fix above against an independent reading of
+# the same real file: the fix gets the ROUTE length right, but a route
+# length alone cannot be priced -- GI ductwork is billed in m² of sheet per
+# size and gauge, not metres of centreline, and the size (e.g. "800x400")
+# is written right there on the drawing as plain text, which this module
+# never read at all. `_DUCT_SIZE_RE` / `_PIPE_SIZE_RE` find a size in any
+# TEXT/MTEXT string; each label is matched to the nearest run by point-to-
+# segment distance, then propagated to every other run in the same
+# straight-line "chain" (same orientation, same line, same width) -- so a
+# trunk broken into several LINE entities by branch take-offs still gets
+# the one size label meant for the whole run, instead of the single
+# nearest segment guessing wrong when two different labels are roughly
+# equidistant from a segment in the middle.
+_DUCT_SIZE_RE = re.compile(r"(\d{2,4})\s*[xX×]\s*(\d{2,4})")
+_PIPE_SIZE_RE = re.compile(r"\bDN\s*(\d{1,4})\b", re.IGNORECASE)
+_SIZE_LABEL_MAX_MM = 3000.0           # a label further than this from every
+                                       # run on the layer is not describing it
+
+
+def _duct_size_labels(texts: list[tuple[tuple[float, float], str]]
+                      ) -> list[tuple[tuple[float, float], str, str]]:
+    """(position, size string, "duct"|"pipe") for every TEXT/MTEXT entity
+    that names a duct size ("800x400", spacing/case tolerant) or a pipe
+    size ("DN80")."""
+    out = []
+    for pos, content in texts:
+        m = _DUCT_SIZE_RE.search(content)
+        if m:
+            out.append((pos, f"{m.group(1)}x{m.group(2)}", "duct"))
+            continue
+        m = _PIPE_SIZE_RE.search(content)
+        if m:
+            out.append((pos, f"DN{m.group(1)}", "pipe"))
+    return out
+
+
+def _point_segment_distance(p, a, b) -> float:
+    ax, ay = a
+    bx, by = b
+    px, py = p
+    dx, dy = bx - ax, by - ay
+    length2 = dx * dx + dy * dy
+    if length2 <= 0:
+        return _dist(p, a)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length2))
+    return _dist(p, (ax + t * dx, ay + t * dy))
+
+
+def _chain_key(run: dict, tol: float = 5.0):
+    """Two runs share a key when they sit on the same straight line, the
+    same duct/pipe width apart -- the signal used to propagate one size
+    label across several LINE entities a branch take-off has split one
+    run into. A diagonal (a transition) is never chained -- it belongs to
+    neither side's label."""
+    (ax, ay), (bx, by) = run["a"], run["b"]
+    off = round((run["offset"] or 0.0) / tol) * tol
+    if abs(ay - by) <= tol:
+        return ("h", round(ay / tol) * tol, off)
+    if abs(ax - bx) <= tol:
+        return ("v", round(ax / tol) * tol, off)
+    return ("d", id(run))
+
+
+def _duct_sizes_for_layer(layer: str, segments: list,
+                          labels: list[tuple[tuple[float, float], str, str]],
+                          expected_kind: str
+                          ) -> list[dict]:
+    """One entry per distinct size found on this layer: {"layer", "size",
+    "kind", "length"} (length in the drawing's own raw unit, same as
+    lengths_by_layer). A run with no label close enough to trust is left
+    out -- silence, not a guessed size.
+
+    `expected_kind` ("duct" or "pipe", from the layer's own name) restricts
+    matching to labels of that same kind only -- caught testing against a
+    real file: a nearby "DN32" pipe label was the closest text to a duct
+    run and got attached to it, producing a nonsensical "duct, DN32" entry.
+    A duct layer is sized from duct-pattern text, a pipe layer from
+    pipe-pattern text, never the other one just because it was closer."""
+    same_kind = [l for l in labels if l[2] == expected_kind]
+    if not same_kind:
+        return []
+    runs = [r for r in _duct_runs(segments) if r["kind"] in ("pair", "single", "bridged")]
+    if not runs:
+        return []
+    chains: dict = {}
+    for r in runs:
+        chains.setdefault(_chain_key(r), []).append(r)
+
+    out = []
+    for members in chains.values():
+        best = None
+        for r in members:
+            for pos, size, kind in same_kind:
+                d = _point_segment_distance(pos, r["a"], r["b"])
+                if best is None or d < best[0]:
+                    best = (d, size, kind)
+        if best is None or best[0] > _SIZE_LABEL_MAX_MM:
+            continue
+        _, size, kind = best
+        out.append({"layer": layer, "size": size, "kind": kind,
+                    "length": sum(r["length"] for r in members)})
+    return out
+
+
+_MM_PER_DRAWING_UNIT = {
+    "millimeters": 1.0, "centimeters": 10.0, "meters": 1000.0,
+    "inches": 25.4, "feet": 304.8,
+}
+
+
+def _duct_size_area(entry: dict, unit: str) -> dict:
+    """Adds length_m and, for a duct (not a pipe), area_m2 -- sheet area,
+    perimeter x length, the number a GI ductwork rate actually prices
+    against. Only when the drawing's unit is one `measure()` can convert
+    with confidence; left out otherwise rather than guessed."""
+    to_mm = _MM_PER_DRAWING_UNIT.get(unit)
+    if not to_mm:
+        return entry
+    length_m = entry["length"] * to_mm / 1000.0
+    entry["length_m"] = round(length_m, 2)
+    if entry["kind"] == "duct":
+        m = _DUCT_SIZE_RE.search(entry["size"])
+        if m:
+            w, h = float(m.group(1)), float(m.group(2))
+            perimeter_m = 2.0 * (w + h) / 1000.0
+            entry["area_m2"] = round(perimeter_m * length_m, 2)
+    return entry
+
+
+# ── rule 4: a corner in a single-line run is an elbow ──────────────────────
+# Safe by construction, unlike the branch-take-off gap this module
+# deliberately does NOT bridge (see HVAC_DRAWING_RULES.md): it only ever
+# looks at two single-line segments that already share an exact endpoint --
+# a hard topological fact read straight off the coordinates, never a fuzzy
+# proximity guess -- so it carries none of that one's false-positive risk
+# of merging two unrelated runs that happen to sit nearby.
+
+def _elbow_count(segments: list) -> int:
+    singles = [r for r in _duct_runs(segments) if r["kind"] == "single"]
+    seen: set = set()
+    for i in range(len(singles)):
+        ai, bi = singles[i]["a"], singles[i]["b"]
+        di = _unit_dir(ai, bi)
+        for j in range(i + 1, len(singles)):
+            aj, bj = singles[j]["a"], singles[j]["b"]
+            dj = _unit_dir(aj, bj)
+            cross = abs(di[0] * dj[1] - di[1] * dj[0])
+            if cross <= 0.3:                  # near-parallel -- a straight run, not a turn
+                continue
+            for p in (ai, bi):
+                for q in (aj, bj):
+                    if _dist(p, q) < 1.0:
+                        seen.add((round(p[0]), round(p[1])))
+    return len(seen)
 
 
 # ── measurement ────────────────────────────────────────────────────────────
@@ -623,6 +1068,7 @@ def measure(dxf_path: str, hvac: bool = False) -> dict:
          "lengths_by_layer": {"WALLS": 142.7, ...},   # drawing units
          "areas_by_layer":   {"ROOM-HATCH": 88.4, ...},
          "block_counts":     {"DOOR-900": 12, "WINDOW-1200": 8, ...},
+         "text_entities":    [((12.0, 4.5), "CAM-01"), ...],  # (x, y), content
          "layers": ["0", "WALLS", ...], "entity_count": 431}
 
     `hvac=True` additionally applies HVAC_DRAWING_RULES.md's rules (today:
@@ -633,6 +1079,20 @@ def measure(dxf_path: str, hvac: bool = False) -> dict:
     because they happen to look paired. The caller decides `hvac` from
     whether the person's own request actually says "HVAC" — see
     addons/boq/dialog.py:_measure().
+
+    `text_entities` (added for BOQ-CHANGES-TODO.md item 65): every real
+    TEXT/MTEXT this same walk already reads, position + content — this
+    function has always collected it internally (rule 3 reads duct/pipe
+    sizes out of it when hvac=True) but never handed it back, which is
+    the only reason addons/boq/drawing_reader.py grew its own, SEPARATE
+    ezdxf walk just to read a DXF's own text: the same file was being
+    parsed twice, by two different modules, for two different slices of
+    the same entities. Returning it here instead means every caller --
+    the GUI's own auto-measure on attach, and the AI-recheck step, ELV's
+    own drawing reading -- shares this ONE walk's answer, not three
+    independent ones that can each see something slightly different.
+    Additive only: every existing key keeps its exact previous meaning
+    and value; no existing caller reads or is affected by this one.
     """
     doc, read_notes = _read_dxf(dxf_path)
 
@@ -656,6 +1116,10 @@ def measure(dxf_path: str, hvac: bool = False) -> dict:
     block_pos: dict[str, list] = {}
     block_scales: dict[str, list] = {}
     layer_geom: dict[str, dict] = {}
+    # Every TEXT/MTEXT on the drawing, position + content -- rule 3 reads
+    # duct/pipe sizes out of these when hvac=True; always collected (cheap)
+    # so the gate lives in one place, where it's used, not here too.
+    text_entities: list[tuple[tuple[float, float], str]] = []
 
     def extend(layer: str, pts, closed: bool):
         g = layer_geom.setdefault(layer, {"minx": 1e300, "miny": 1e300,
@@ -696,6 +1160,11 @@ def measure(dxf_path: str, hvac: bool = False) -> dict:
                 add(lengths, layer, _arc_length(e))
             elif t == "HATCH":
                 add(areas, layer, _hatch_area(e))
+            elif t in ("TEXT", "MTEXT"):
+                content = e.dxf.text if t == "TEXT" else e.text
+                if content:
+                    text_entities.append(
+                        ((float(e.dxf.insert.x), float(e.dxf.insert.y)), str(content)))
             elif t == "INSERT":
                 name = e.dxf.name
                 if not name.startswith("*"):   # anonymous/system blocks
@@ -718,21 +1187,58 @@ def measure(dxf_path: str, hvac: bool = False) -> dict:
             # must not sink the whole takeoff — skip it, keep going.
             continue
 
+    duct_sizes: list[dict] = []
+    size_labels = _duct_size_labels(text_entities) if hvac else []
     for layer, segments in line_segments.items():
+        # Rule 3 only ever looks at a layer that names itself duct or pipe
+        # work ("M-DUCT-SUPPLY", "M-PIPE-CHW-S") -- caught testing against
+        # the real file: proximity alone wrongly matched A-WALL (the
+        # architectural perimeter, which naturally runs right past the
+        # ductwork's own size labels) to "800x400 SA". A layer's own name
+        # is the one signal this whole module already trusts elsewhere
+        # (block_layers' legend -- see measure()'s own comment on INSERT).
+        expected_kind = ("duct" if "duct" in layer.lower()
+                         else "pipe" if "pipe" in layer.lower() else "")
         if hvac:
-            total, pair_count = _collapse_duct_pairs(segments)
+            total, pair_count, transition_count, bridged_count = _collapse_duct_pairs(segments)
         else:
             # The plain, original sum -- every other trade's drawings keep
             # measuring exactly as they always did; HVAC_DRAWING_RULES.md's
             # rules only ever apply when `hvac` says so.
             total = sum(_dist(a, b) for a, b in segments)
-            pair_count = 0
+            pair_count = transition_count = bridged_count = 0
         add(lengths, layer, total)
         if pair_count:
             read_notes.append(
                 f"{layer}: read {pair_count} pair(s) of lines as one run's "
                 "two edges, not two separate runs (a duct/pipe/tray drawn "
                 "to its real width) — verify before pricing.")
+        if transition_count:
+            read_notes.append(
+                f"{layer}: read {transition_count} tapering transition(s) "
+                "(e.g. a reducer) as one length each, not both converging "
+                "sides — HVAC_DRAWING_RULES.md rule 2, verify before pricing.")
+        if bridged_count:
+            read_notes.append(
+                f"{layer}: bridged {bridged_count} gap(s) between collinear "
+                "same-width duct lines into one continuous run — no branch "
+                "ties in at that point, so read as the trunk continuing "
+                "through, not a break; HVAC_DRAWING_RULES.md rule 2, verify "
+                "before pricing.")
+        if hvac and expected_kind:
+            for entry in _duct_sizes_for_layer(layer, segments, size_labels, expected_kind):
+                duct_sizes.append(_duct_size_area(entry, unit))
+            elbows = _elbow_count(segments)
+            if elbows:
+                read_notes.append(
+                    f"{layer}: {elbows} corner(s) found in the single-line "
+                    "run(s) — read as elbow fittings, not route length; "
+                    "HVAC_DRAWING_RULES.md rule 4.")
+    if hvac and size_labels and not duct_sizes:
+        read_notes.append(
+            "Duct/pipe size text was found on the drawing but none of it "
+            "sat close enough to a measured run to trust — sizes left out "
+            "rather than guessed; HVAC_DRAWING_RULES.md rule 3.")
 
     try:
         site = _site_facts(unit_code, lengths, layer_geom, block_pos, block_scales)
@@ -747,6 +1253,15 @@ def measure(dxf_path: str, hvac: bool = False) -> dict:
         "areas_by_layer": dict(sorted(areas.items())),
         "block_counts": dict(sorted(blocks.items())),
         "block_layers": {k: sorted(v) for k, v in sorted(block_layers.items())},
+        # HVAC_DRAWING_RULES.md rule 3: one entry per distinct duct/pipe
+        # size actually found and trusted, empty when hvac=False or no
+        # size text was readable. Additive -- lengths_by_layer is
+        # untouched and stays the single per-layer total it always was.
+        "duct_sizes": duct_sizes,
+        # item 65: the raw TEXT/MTEXT this walk already collected (see this
+        # function's own docstring) -- every caller's one shared source for
+        # a DXF's own real text, instead of each re-parsing the file itself.
+        "text_entities": text_entities,
         # From the entities actually walked, NOT doc.layers.entries — a
         # minimal-mode DWG→DXF conversion can leave the formal layer TABLE
         # nearly empty (confirmed: 2 table entries vs. 64 real layer names
@@ -959,6 +1474,16 @@ def write_quantities_csv(q: dict, path: str) -> None:
             w.writerow(["area", layer, f"{area:.2f}", f"square {q['unit']}"])
         for name, count in q["block_counts"].items():
             w.writerow(["count", name, count, "nos"])
+        # HVAC_DRAWING_RULES.md rule 3: one row per distinct duct/pipe size
+        # actually found and trusted, with its own sheet area when it's a
+        # duct -- the number a GI ductwork rate prices against, not just
+        # the plain route length above.
+        for entry in (q.get("duct_sizes") or []):
+            name = f"{entry['layer']} — {entry['size']}"
+            if entry["kind"] == "duct" and "area_m2" in entry:
+                w.writerow(["duct size", name, f"{entry['area_m2']:.2f}", "sq m"])
+            elif "length_m" in entry:
+                w.writerow(["duct size", name, f"{entry['length_m']:.2f}", "m"])
         # A rule (HVAC_DRAWING_RULES.md rule 1, today) inferred rather than
         # purely measured a number -- stays in the file this re-opens as,
         # not only the live app's own screen, so it survives being emailed
@@ -1003,6 +1528,29 @@ def summary_text(q: dict) -> str:
         lines += [f"  {layer}: {length:.2f} {q['unit']}"
                   for layer, length in q["lengths_by_layer"].items()]
         lines.append("")
+    if q.get("duct_sizes"):
+        # HVAC_DRAWING_RULES.md rule 3: real sizes read off the drawing's
+        # own TEXT, per duct/pipe run -- use these directly; the length
+        # above is the same run's plain total, this is the size split.
+        # Several branch take-offs on one layer can share one size, each
+        # its own short "chain" -- aggregated here (layer, size, kind) so
+        # the writer sees one line per size, not a dozen near-duplicates.
+        agg: dict[tuple[str, str, str], dict] = {}
+        for entry in q["duct_sizes"]:
+            key = (entry["layer"], entry["size"], entry["kind"])
+            bucket = agg.setdefault(key, {"length_m": 0.0, "area_m2": 0.0})
+            bucket["length_m"] += entry.get("length_m", entry["length"])
+            bucket["area_m2"] += entry.get("area_m2", 0.0)
+        lines.append("DUCT/PIPE SIZES (read from the drawing's own size "
+                     "text — use these real sizes directly in the BOQ, do "
+                     "not mark them 'TBC — to HVAC schedule'):")
+        for (layer, size, kind), bucket in agg.items():
+            if kind == "duct" and bucket["area_m2"]:
+                lines.append(f"  {layer} {size}: {bucket['length_m']:.2f} m "
+                             f"run, {bucket['area_m2']:.2f} m² sheet area")
+            else:
+                lines.append(f"  {layer} {size}: {bucket['length_m']:.2f} m")
+        lines.append("")
     if q["areas_by_layer"]:
         lines.append("AREAS BY LAYER:")
         lines += [f"  {layer}: {area:.2f} square {q['unit']}"
@@ -1019,6 +1567,22 @@ def summary_text(q: dict) -> str:
             # Rich terminal panel, which eats "[...]" as a style tag.
             hint = f"  (drawn on layer: {', '.join(lyrs)})" if lyrs else ""
             lines.append(f"  {name}: {count}{hint}")
+    if q.get("text_entities"):
+        # item 65: real TEXT/MTEXT, not a block and not a measured line --
+        # schedule notes, device tags, legend text. Was read internally by
+        # this same walk all along (rule 3's own duct-size matching) but
+        # never shown here; every caller of summary_text() now gets it for
+        # free, no new consent, no AI, regardless of industry.
+        from collections import Counter
+        texts = Counter(content for _, content in q["text_entities"])
+        lines.append("")
+        lines.append("TEXT ON THE DRAWING (every real TEXT/MTEXT entity read "
+                     "directly off the drawing, not estimated — schedule "
+                     "notes, tags, labels not already counted as a block "
+                     "above):")
+        for content, count in texts.items():
+            suffix = f"  (×{count})" if count > 1 else ""
+            lines.append(f"  {content}{suffix}")
     if not (q["lengths_by_layer"] or q["areas_by_layer"] or q["block_counts"]):
         lines.append("No measurable LINE/POLYLINE/HATCH/INSERT geometry found — "
                      "the drawing may use 3D solids or an unsupported entity type.")
@@ -1041,17 +1605,81 @@ def summary_text(q: dict) -> str:
 _TEMPLATE_EXTS = (".docx", ".doc", ".xlsx", ".xls", ".csv", ".ods", ".pdf")
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
 
+# A PDF with at least this much extractable text MIGHT be a real document
+# (a sample BOQ, a spec) rather than a scanned/vector drawing with no text
+# layer -- "might", because raw text alone isn't enough, see
+# _looks_like_boq_document below. Not zero: a scan can carry a stray OCR
+# layer or a title-block watermark and still have nothing a sample-BOQ read
+# would use.
+# Found live, 2 Nov 2026: a hand-sketched SS locker fabrication drawing
+# (970x450x2000mm, qty 40, dimensions all clearly labelled -- nothing to
+# guess) was filed here as a "sample BOQ" purely because it was a .pdf, with
+# zero extractable text and a title that said "drawing" -- the writer stage
+# correctly refused to invent a BOQ from a document it couldn't read, and
+# "Make with drawing" (addons/boq/dialog.py's own explicit, consent-gated
+# path for exactly this case) never turned on, because cad_path was never
+# set for anything but .dwg/.dxf.
+_PDF_TEXT_MIN_CHARS = 40
+
+# Found live the very next day, 3 Nov 2026, on a DIFFERENT real client file:
+# a real, proper CAD-exported (not scanned) 10-page PDF of pharma trolleys
+# and storage racks -- real vector text, 2,842 characters total, comfortably
+# over _PDF_TEXT_MIN_CHARS above, so the fix above filed it as a "sample
+# BOQ" too, for the opposite reason: not too little text, just the WRONG
+# KIND -- dimension numbers and one-line material/capacity callouts
+# ("900\n1850…", "Material - SS", "Weight Capacity - 30 Kg", "16 SWG Top"),
+# none of it reading anything like a BOQ document. "Has text" was never the
+# real question; "reads like a BOQ" is. A real BOQ -- any trade, any firm's
+# own template, confirmed against every sample BOQ excerpt read in this
+# codebase's own session history -- names its own column set and section
+# shape somewhere in its text; a drawing's extracted text, scanned or real
+# vector, does not, no matter how many characters it has. Two distinct hits
+# required, not one: a drawing's own title block can genuinely say "section"
+# or "qty" once in passing without being a BOQ.
+_BOQ_DOCUMENT_SIGNALS = (
+    "bill of quantities", "bill of quantity", "description", "quantity",
+    "qty", "rate", "amount", "preamble", "sr.no", "sr no", "sr. no",
+    "item no", "unit rate", "provisional sum", "to confirm",
+)
+
+
+def _looks_like_boq_document(text: str) -> bool:
+    """True if `text` (already lowercased by the caller) reads like an
+    actual BOQ/estimate document -- at least two distinct signal terms,
+    not merely some text existing at all. See _BOQ_DOCUMENT_SIGNALS."""
+    return sum(1 for s in _BOQ_DOCUMENT_SIGNALS if s in text) >= 2
+
 
 def classify_inputs(attachments: list[dict]):
     """Sort what the user attached by the ROLE it plays in a BOQ run:
     (cad, templates, images, notes). A screenshot of the drawing's legend
     sheet is not a template and must not be described to the AI as one —
-    they carry completely different instructions."""
+    they carry completely different instructions.
+
+    A .pdf is ambiguous by extension alone -- a sample BOQ and a scanned/
+    exported drawing are both routinely delivered as PDF, and a real
+    (non-scanned) drawing export can carry plenty of extracted text that
+    still is not a BOQ document (dimension labels, material callouts) --
+    see _looks_like_boq_document. Disambiguated by content, using the text
+    CB.files.attach() already extracted (no extra I/O here): read as a BOQ
+    document, it's a template; anything else -- too little text, or real
+    text that doesn't read as one -- is treated as a drawing with no vector
+    geometry to measure (cad), same bucket .dwg/.dxf go in, so "Make with
+    drawing" sees it and the automatic .dwg/.dxf measurement step is what
+    skips it (see addons/boq/dialog.py's _absorb(), which only measures a
+    .dwg/.dxf cad_path -- there is no deterministic measurement for a PDF,
+    only the AI actually looking at it, by explicit choice)."""
     cad, templates, images, notes = [], [], [], []
     for a in attachments:
         ext = os.path.splitext(a.get("path", ""))[1].lower()
         if ext in (".dwg", ".dxf"):
             cad.append(a)
+        elif ext == ".pdf":
+            text = (a.get("text") or "").strip()
+            if len(text) >= _PDF_TEXT_MIN_CHARS and _looks_like_boq_document(text.lower()):
+                templates.append(a)
+            else:
+                cad.append(a)
         elif ext in _IMAGE_EXTS:
             images.append(a)
         elif ext in _TEMPLATE_EXTS:
@@ -1190,8 +1818,22 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
                       has_template: bool = False, legend: str = "",
                       scoped: bool = False, brief_text: str = "",
                       allow_derived: bool = True, has_cad: bool = True,
-                      standards_text: str = "") -> str:
+                      standards_text: str = "", industry_note: str = "",
+                      derivation_example: str = "") -> str:
     """`allow_derived` is the difference between a takeoff and an estimate.
+
+    `industry_note` and `derivation_example` keep this function itself
+    industry-agnostic (found live, 31 Oct 2026: the owner's own standing
+    rule is that a trade-specific write-up rule must live apart and fire
+    only when that trade is named -- the HVAC rules this function used to
+    carry inline, gated on a bare `hvac: bool`, were already breaking that
+    rule, just one `if` away from leaking into every other trade's own
+    BOQ). The CALLER supplies both, already resolved for whatever industry
+    it is writing for (addons/boq/industries.py owns that text on the app
+    side -- this engine-side function never hardcodes a single industry's
+    wording). Empty strings reproduce this function's old ELV/general
+    default behaviour exactly, so every existing caller that passes
+    neither keeps working unchanged.
 
     A survey/civil drawing legitimately contains no CCTV, cabling or fibre
     geometry — nobody has designed those yet. Forbidding un-measured line
@@ -1268,9 +1910,7 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
         "you have not been given.\n"
         "  (d) Work like the estimator who wrote the best of these: open "
         "with a short reference table of the measured figures you used "
-        "(feature, layer or block, value, unit); when two layers look like "
-        "the same feature (a duplicate or misspelt name), decide — count it "
-        "once or keep both — and say why; size storage, power and "
+        "(feature, layer or block, value, unit); size storage, power and "
         "switching from the device counts with the arithmetic shown; where "
         "the drawing already has poles, walls or structures, use them as "
         "mounting or routing points before adding new ones; and keep every "
@@ -1278,6 +1918,14 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
         "plausible for the site's actual size and stated on the line.\n"
         "Do not skip this and jump to formatting."
     ) if has_cad else ""
+    # The caller's own per-industry write-up note -- see this function's
+    # docstring. Used to be a block of HVAC text hardcoded right here,
+    # gated on a bare `hvac: bool`; that text now lives on the app side
+    # (addons/boq/industries.py), the one place per-industry BOQ rules are
+    # supposed to live. Gating is unchanged: a trade-specific note only
+    # makes sense once there is real measured geometry (has_cad) to apply
+    # it to.
+    industry_note = industry_note if has_cad else ""
     if not has_cad:
         # Spec mode: no drawing exists at all. Everything is derived from the
         # stated requirement, so the rules are about being explicit and
@@ -1304,26 +1952,33 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
             "the reader should be able to tell them apart at a glance."
         )
     elif allow_derived:
+        # Found live, 31 Oct 2026: this whole paragraph used to be written
+        # in ELV's own vocabulary (camera spacing, boundary and road
+        # lengths, gate counts) -- every other trade's own BOQ run,
+        # HVAC included, received that same ELV framing and worked
+        # example whether or not any of it applied. The arithmetic
+        # example is now the caller's own `derivation_example` (empty
+        # falls back to the original ELV one, unchanged for a trade with
+        # no override yet); the framing sentence itself is now
+        # trade-agnostic rather than naming ELV's own items by name.
+        example = derivation_example or "'boundary 1091 m ÷ 40 m camera spacing = 28 nos'"
         derive_rule = (
-            " IMPORTANT — how to handle a trade the drawing does not contain: "
-            "a survey or civil drawing legitimately has NO camera, cable, "
-            "conduit or fibre geometry, because that system has not been "
-            "designed yet. Do NOT refuse the job on that basis, and do NOT "
-            "silently pretend those items were measured. Instead DERIVE them "
-            "as a competent ELV/services estimator would: work the quantities "
-            "out from the site's real measured geometry (boundary and road "
-            "lengths, gate and building counts, existing pole positions) "
-            "combined with explicit, stated design assumptions (camera "
-            "spacing, cable-run and slack allowances, termination points). "
-            "Rules for derived items: (a) open the document with a prominent "
-            "warning box stating this is a PROVISIONAL DESIGN-STAGE ESTIMATE "
-            "derived from civil geometry, not a measured take-off, and that "
-            "it must be validated by a site survey and detailed design before "
-            "tendering; (b) under each section heading, state the design "
-            "basis in one or two lines — the actual arithmetic, e.g. 'boundary "
-            "1091 m ÷ 40 m camera spacing = 28 nos'; (c) never present a "
-            "derived quantity as a measured one. Measured civil items, where "
-            "the user asked for them, stay exactly as measured."
+            " IMPORTANT — how to handle an item the drawing's own measured "
+            "geometry does not cover: a system, accessory or whole trade "
+            "the design hasn't detailed yet, or that this drawing doesn't "
+            "show at all. Do NOT refuse the job on that basis, and do NOT "
+            "silently pretend those items were measured. Instead DERIVE "
+            "them as a competent estimator for this trade would: work the "
+            "quantities out from the site's own real measured geometry, "
+            "combined with explicit, stated design assumptions. Rules for "
+            "derived items: (a) open the document with a prominent warning "
+            "box stating this is a PROVISIONAL DESIGN-STAGE ESTIMATE, not a "
+            "measured take-off, and that it must be validated by a site "
+            "survey and detailed design before tendering; (b) under each "
+            f"section heading, state the design basis in one or two lines "
+            f"— the actual arithmetic, e.g. {example}; (c) never present a "
+            "derived quantity as a measured one. Measured items, where the "
+            "user asked for them, stay exactly as measured."
         )
     else:
         derive_rule = (
@@ -1343,6 +1998,27 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
         f"\n\nLAYER/BLOCK LEGEND (what these codes mean — use it to write real "
         f"descriptions instead of repeating the raw code):\n{legend}"
     ) if legend.strip() else ""
+    # item 50 (4 Nov 2026) — see addons/boq/dialog.py's own copy of this
+    # comment for the real-job comparison that found it: "add 100mm in
+    # length and breadth for scrap" was read by the writer as a sheet-panel
+    # instruction only ("length and breadth" of a panel) — every tube/rod/
+    # flat-bar CUT LENGTH kept its bare spec figure, with the writer's own
+    # notes saying tubes got no allowance at all. A second, independent run
+    # of the identical PDF and instruction applied the allowance to every
+    # cut piece, tube and rod included — a difference in how one ambiguous
+    # instruction was read, not a measurement error either run made. Scoped
+    # to project_context (the person's own words), the same text this
+    # function already embeds as `context` above, never applied unasked.
+    scrap_block = (
+        "\n\nSCRAP/WASTAGE ALLOWANCE. The project context above asks for a "
+        "cutting allowance. Apply it to EVERY raw-material cut piece, not "
+        "sheet panels alone: the cut length of every tube, pipe, flat bar "
+        "and rod section, AND the length and width of every sheet/plate "
+        "panel. Show both the net (as-designed) and gross (with the "
+        "allowance added) figure on each line, and state the allowance "
+        "used once, plainly, near the top."
+    ) if re.search(r"\bscrap\b|\bwastage\b|\bwaste\b",
+                   project_context or "", re.I) else ""
     ground_truth = (
         " The quantities listed at the end were measured directly from the "
         "CAD drawing's geometry — treat them as ground truth and do not "
@@ -1369,7 +2045,7 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
     )
     instructions = (
         f"Your task is: produce a professional Bill of Quantities (BOQ) "
-        f"document.{context}{ground_truth}{cad_note}"
+        f"document.{context}{ground_truth}{cad_note}{industry_note}"
         f"{step2}{derive_rule}{scope_rule} {structure}{plausibility_rule} "
         "Leave Rate/Amount columns blank for the quantity surveyor to fill "
         "in. Present it as clean tables. Note prominently at the top that "
@@ -1383,4 +2059,4 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
     # House doctrine for a BOQ, when a skill claims this job — see
     # core/skills.py. Empty when none does, so the prompt is unchanged.
     return (instructions + standards_block + brief_block + legend_block
-            + _SK.addendum("boq.format") + tail)
+            + scrap_block + _SK.addendum("boq.format") + tail)

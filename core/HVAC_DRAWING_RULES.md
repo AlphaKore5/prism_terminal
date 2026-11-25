@@ -117,15 +117,167 @@ measured: an ordinary single-line (centreline/schematic) run is untouched.
     function) to work on LWPOLYLINE segments the same way, rather than
     writing a second, divergent algorithm.
   - **A converging/tapering transition (a reducer)** is correctly left
-    un-paired (its two sides are not parallel), so its own edge length is
-    counted in full on each side rather than a true centreline length —
-    a small, known, accepted imprecision for that one kind of fitting,
-    not something this rule tries to solve.
-  - **The visible audit trail is a plain-text note, not a UI flag.** Right
-    now `measure()` appends a note like "M-DUCT-SUPPLY: read 10 pair(s) of
-    lines as one run's two edges... — verify before pricing" to the notes
-    list the BOQ dialog already surfaces. Nothing routes this to a more
-    prominent "this quantity was inferred, check it" indicator in the
-    BOQ add-on's own screen yet — worth doing once more than one of these
-    rules exists and a person needs to see at a glance which numbers were
-    geometry straight from the drawing and which were inferred.
+    un-paired (its two sides are not parallel) — rule 2, below, now counts
+    it once rather than twice.
+  - **The visible audit trail was a plain-text note, no stronger signal.**
+    23 Oct 2026: the BOQ add-on's measured-quantities panel now also
+    tints every row green/yellow/red by how much it should be trusted,
+    with a dedicated Trust column (a solid dot, not just a pale
+    background) — see `addons/boq/measured.py:severity_for()`. The plain-
+    text note in `q["notes"]` is still the only thing that reaches the
+    exported CSV, which still matters once the live screen is closed.
+
+---
+
+## Rule 2 — a tapering transition (a reducer) counts once, not twice
+
+**Found:** 23 Oct 2026, re-verifying rule 1's own fix against a second,
+independent reading of the same real file. Rule 1 correctly brought the
+supply duct down from the original bug's 78.82 m to 38.32 m — but the true
+route is 38.80 m, and the gap was not noise: it was the reducer.
+
+**The convention:** a reducer/transition between two different duct widths
+is drawn as two short lines that **converge** (not parallel) — correctly
+left un-paired by rule 1, since rule 1 only ever matches parallel pairs.
+But the original code then summed both of those converging lines in full,
+which double-counts the transition by about its own length: two diagonal
+edges describing ONE short piece of duct, not two.
+
+**The fix — `_duct_runs()` in `core/boq.py`** (rule 1's own pairing logic,
+refactored to also produce this): among the segments rule 1 leaves
+unpaired, look for two that are:
+  - roughly the **same length** (within 8%, same test rule 1 uses),
+  - genuinely **converging**, not parallel (the complement of rule 1's own
+    parallel test — if they were parallel, rule 1 would already own them),
+  - **both ends a plausible duct width apart** (20–2000 mm) — one gap at
+    the start, a *different* gap at the end, which is exactly what makes
+    it a transition and not a pair,
+  - **no longer than the widest confirmed pair already found on the
+    layer** — the one check standing between this and mistaking an
+    unrelated long diagonal duct run elsewhere on the same layer for a
+    transition.
+
+A matched transition contributes its own average length **once**, the same
+as a matched pair does — not both diagonals summed.
+
+**What it does NOT handle yet:**
+  - **The transition's TRUE centreline length** (the straight-line
+    distance between the two duct axes, which for a short reducer is
+    usually a little shorter than either diagonal edge) is not computed —
+    the average of the two edges is used instead, which is close but not
+    exact. A small, known, accepted imprecision for this one fitting.
+  - **Branch take-off gaps are now bridged, but only with real topology
+    behind it (25 Oct 2026).** The first version of this idea bridged
+    every gap between two collinear, same-width paired runs and was
+    rejected before shipping (see git history / BOQ-CHANGES-TODO.md item
+    14 for the original write-up): it read a trunk that takes off
+    branches from BOTH sides at the same point (very common) as one
+    continuous run straight through the trunk's own body, silently adding
+    the trunk's own width as if it were missing duct.
+
+    **The real topology check that was missing:** a gap is bridged only
+    when NOTHING else on the same layer has an endpoint landing inside
+    it. When something does — a branch tying in, confirmed exactly on
+    `hvac_tender_complex.dxf`'s M-DUCT-SUPPLY trunk, where two branches
+    cross from opposite sides at the same point, x=13275-13725 — that is
+    a real tee/cross junction, and the gap is the fitting's own width,
+    not missing straight duct; left un-bridged, same as before this rule
+    existed. A gap with nothing tied into it — a trunk split into two
+    LINE entities for no topological reason — IS bridged. Verified
+    against the real file both ways: its own 3 real junction gaps all
+    stay un-bridged (143,862.5mm total, unchanged from before this rule);
+    a synthetic gap with nothing crossing it correctly bridges.
+    `_duct_runs()`'s new "bridged" kind, `_collapse_duct_pairs()`'s 4th
+    return value. Tests:
+    `tests/test_double_line_ducts.py::
+    ABranchTakeOffGapIsBridgedOnlyWhenNoBranchTiesIn`.
+
+---
+
+## Rule 3 — a duct/pipe's size lives in the drawing's own TEXT, not its geometry
+
+**Found:** 23 Oct 2026, the same day, from two independent directions at
+once: the owner's own follow-up question ("is the CSV enough to make an
+HVAC BOQ?") and a second AI review of the same file, both landing on the
+identical gap. A route length alone cannot be priced — GI ductwork is
+billed in **m² of sheet per size and gauge**, not metres of centreline —
+and the size ("800x400", "DN80") is written right on the drawing as plain
+TEXT, which `measure()` never read at all.
+
+**The convention:** a duct/pipe's size is annotated as a nearby TEXT or
+MTEXT entity — "800x400 SA", "600x300 RA", "CHWS DN80" — usually on its
+own annotation layer (M-TEXT here), not the duct's own layer, and usually
+positioned near one point along a run rather than repeated at every
+segment a branch take-off happens to split that run into.
+
+**The fix — `_duct_size_labels()` / `_duct_sizes_for_layer()` in
+`core/boq.py`:** `_DUCT_SIZE_RE` / `_PIPE_SIZE_RE` find a size in any
+TEXT/MTEXT string on the drawing. Each layer's runs (from `_duct_runs()`)
+are grouped into "chains" — runs on the same straight line, the same
+duct/pipe width apart, regardless of the gap between them (a branch
+take-off splits one physical run into several LINE entities, and the
+label is only ever near one of them). Each CHAIN, not each individual
+run, is matched to its nearest label by point-to-segment distance — taking
+the chain's single best (closest) candidate across all its members, which
+is what correctly resolves a segment in the middle of a long trunk that
+would, on its own, sit roughly equidistant between two different labels
+and guess the wrong one; its unambiguous neighbour's own close match
+settles it for the whole chain. A duct's area is `perimeter × length`
+(`_duct_size_area()`), computed in m² when the drawing's unit is
+confirmed, left out otherwise rather than guessed. **Scoped to layers that
+name themselves duct or pipe work** (`"duct" in layer.lower()` /
+`"pipe" in ...`) — caught live, before shipping: proximity alone wrongly
+matched A-WALL, the architectural perimeter (which naturally runs right
+past the ductwork's own size labels), to "800x400 SA". The layer's own
+name is the one signal this whole module already trusts elsewhere (see
+`measure()`'s own comment on `block_layers`).
+
+Output lands in a new, additive `q["duct_sizes"]` list — `lengths_by_layer`
+is completely untouched, still the one simple per-layer total it always
+was. Each entry: `{"layer", "size", "kind" ("duct"|"pipe"), "length"
+(drawing's own unit), "length_m", "area_m2" (ducts only)}`. Also written
+as extra rows in the exported quantities CSV.
+
+**What it does NOT handle yet:**
+  - **An unusually named duct/pipe layer** (not containing "duct" or
+    "pipe") gets no sizes at all, by design — silence over a wrong guess.
+    If a client file uses a different convention, extend the name check,
+    don't loosen the proximity matching.
+  - **Two genuinely different-sized runs that happen to share the exact
+    same line and width** (same y/x, same offset, by coincidence) would be
+    chained together and given one label — a rare, specific edge case, not
+    seen in the real file, worth a test the day it actually turns up.
+  - **A transition's own size** (the reducer itself, e.g. "800x400 to
+    600x400") is not labelled or sized — only "pair" and "single" kind
+    runs get chained; a "transition" run is left out of `duct_sizes`
+    entirely.
+
+---
+
+## Rule 4 — a corner in a single-line run is an elbow fitting
+
+**Found:** 23 Oct 2026, the same file: the return duct (drawn single-line,
+not double) turns one corner, which a real BOQ has to list as a fitting,
+not silently fold into the route length.
+
+**The fix — `_elbow_count()` in `core/boq.py`:** among a layer's "single"
+kind runs (rule 1/2 already resolved — never a pair, never a transition),
+count how many pairs of them **share an exact endpoint** (within 1 mm) with
+a clear change of direction. Deliberately the opposite kind of check from
+rule 2's rejected gap-bridging: this only ever looks at two segments that
+already share a real, exact coordinate — a hard topological fact read
+straight off the geometry, not a proximity guess — so it carries none of
+that one's false-positive risk of merging two unrelated runs that happen
+to sit nearby. Reported as a plain note, e.g. "M-DUCT-RETURN: 1 corner(s)
+found... — read as elbow fittings."
+
+**What it does NOT handle yet:**
+  - **Tee/cross junctions** (a branch take-off meeting a trunk) are not
+    counted at all — the same topological-ambiguity problem that sunk rule
+    2's gap-bridging idea applies here too (which branch belongs to which
+    side of the trunk is not a question proximity alone can answer
+    safely). Left for a future rule that reasons about real topology.
+  - **A bend inside a PAIRED (double-line) run** is not detected — only
+    single-line runs are checked, since a pair's own two edges already
+    describe its direction, and generalising this safely to paired runs
+    needs its own test, not an assumption it works the same way.

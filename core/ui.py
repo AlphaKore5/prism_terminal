@@ -87,6 +87,26 @@ def _unescape(msg: str) -> str:
     return msg.replace("\\[", "[")
 
 
+_rewriter = None
+
+
+def set_rewriter(fn) -> None:
+    """Pass every message through `fn(text) -> text` before it is shown or
+    handed to the sink (the GUI uses it to drop browser-era words while AI
+    runs on Prism's server). None removes it."""
+    global _rewriter
+    _rewriter = fn
+
+
+def _rewrite(msg):
+    if _rewriter is None:
+        return msg
+    try:
+        return _rewriter(str(msg))
+    except Exception:
+        return msg
+
+
 def _tell(level: str, msg: str) -> None:
     """Hand one message to the sink, if there is one. Never raises: a broken
     listener must not take down the run it is only watching."""
@@ -114,6 +134,7 @@ def say(msg: str, style: str = "", _level: str = "info"):
     # ok/warn/err/info all route through here, and each passes its own level
     # so a listener can tell a warning from a progress note without parsing
     # the emoji back out of the text.
+    msg = _rewrite(msg)
     _tell(_level, msg)
     if _RICH:
         console.print(msg, style=style)

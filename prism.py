@@ -2049,7 +2049,7 @@ def cmd_motion(cfg: dict, request: str, attachments: list | None = None):
                 {}, cfg, attachments=attachments, chatgpt_analysis=False,
                 custom_stages=[("storyboard", agent, [prompt])],
                 motion_design_stage="storyboard",
-                motion_skeleton="cinematic_glass",
+                motion_skeleton=cfg.get("motion_skeleton") or "cinematic_glass",
                 query=f"motion graphic — {request}")
 
             texts = [t for t in (responses.get("storyboard") or []) if t.strip()]

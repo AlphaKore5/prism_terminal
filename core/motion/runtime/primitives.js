@@ -224,9 +224,20 @@ class TextNode extends Node {
     this.fontSize       = props.font_size      || 48;
     this.fontWeight     = props.font_weight    || 700;
     this.fill           = props.fill           || "#FFFFFF";
-    this.align          = props.align          || "center";
+    // Lines inside a left-anchored block read left, a right-anchored one
+    // right — unless the spec says otherwise. Centred lines in a block
+    // whose anchor is its left edge look like a mistake, not a choice.
+    this.align          = props.align
+      || (this.anchor[0] < 0.34 ? "left" : this.anchor[0] > 0.66 ? "right" : "center");
     this.lineHeight     = props.line_height    || 1.25;
     this.mode           = props.mode           || "standard";
+    // `runs`: [{text, fill?, gradient?, weight?}] — one line (or several, split
+    // on "\n") whose parts differ in colour/weight. `type_on` reveals it one
+    // character at a time with a caret that follows, at `type_rate` per second.
+    this.runs           = Array.isArray(props.runs) && props.runs.length ? props.runs : null;
+    this.typeOn         = !!props.type_on;
+    this.typeRate       = props.type_rate      || 16;
+    this.caret          = props.caret !== undefined ? !!props.caret : true;
     this.revealStart    = props.reveal_start   || 0.0;
     this.revealDuration = props.reveal_duration || 0.75;
     this.gradient       = props.gradient       || null;
@@ -269,8 +280,18 @@ class TextNode extends Node {
   }
 
   initDOM(box) {
-    box.style.transform = "translate(-50%,-50%)";
+    // The anchor, honoured the way every other primitive honours it. A
+    // percentage translate is measured against the box's OWN laid-out
+    // size, so [0.5, 0.5] is the old translate(-50%,-50%) exactly and
+    // [0, 0] puts the text's top-left corner on `position` — which is
+    // what generate.py's catalogue promises the model and what
+    // inspect._node_bounds measures. Before this, text was the one node
+    // type that ignored its anchor: a headline the model left-anchored
+    // at x=80 was centred ON x=80 and lost its first half off the frame
+    // (the 11 Nov 2026 study, finding M1).
+    box.style.transform = `translate(${-this.anchor[0] * 100}%, ${-this.anchor[1] * 100}%)`;
     box.style.textAlign = this.align;
+    if (this.runs) { this._initRuns(box); return; }
     this._lines = this.content ? String(this.content).split(/\r?\n/) : [];
     this._lineEls = [];
     this._lineState = [];
@@ -395,7 +416,56 @@ class TextNode extends Node {
     }
   }
 
+  _initRuns(box) {
+    const lines = [[]];
+    for (const r of this.runs) {
+      String(r.text || "").split(/\r?\n/).forEach((part, k) => {
+        if (k > 0) lines.push([]);
+        if (part) lines[lines.length - 1].push({ ...r, text: part });
+      });
+    }
+    this._lineEls = []; this._lines = []; this._lineState = [];
+    this._runChars = []; this._runCarets = [];
+    const caretColour = this.fill && !this.gradient ? this.fill : "#111111";
+    for (const line of lines) {
+      const el = document.createElement("div");
+      this._applyBaseTextStyle(el);
+      for (const r of line) {
+        const span = document.createElement("span");
+        span.style.whiteSpace = "pre";
+        if (r.weight) span.style.fontWeight = String(r.weight);
+        if (r.font_family) span.style.fontFamily = r.font_family;
+        if (r.gradient && r.gradient.stops) {
+          span.style.backgroundImage = _gradientCss(r.gradient);
+          span.style.webkitBackgroundClip = "text"; span.style.backgroundClip = "text";
+          span.style.color = "transparent";
+        } else if (r.fill) {
+          span.style.color = r.fill;
+        }
+        if (this.typeOn) {
+          for (const ch of Array.from(r.text)) {
+            const c = document.createElement("span");
+            c.textContent = ch; c.style.whiteSpace = "pre"; c.style.visibility = "hidden";
+            span.appendChild(c); this._runChars.push(c);
+            if (this.caret) { const k = _caretEl(this.fontSize, r.caret_fill || caretColour); span.appendChild(k); this._runCarets.push(k); }
+            else this._runCarets.push(null);
+          }
+        } else {
+          span.textContent = r.text;
+        }
+        el.appendChild(span);
+      }
+      box.appendChild(el);
+      this._lineEls.push(el); this._lines.push(line.map(r => r.text).join("")); this._lineState.push({});
+    }
+  }
+
   registerContentAnimation(masterTl) {
+    if (this.runs) {
+      if (this._runChars && this._runChars.length)
+        _typeOn(masterTl, this._runChars, this._runCarets, this.revealStart, this.typeRate, this.caret);
+      return;
+    }
     for (let i = 0; i < this._lineEls.length; i++) {
       this._registerLineMode(this._lineEls[i], this._lines[i], this._lineState[i], i, masterTl);
     }
@@ -629,7 +699,10 @@ class LightFieldNode extends Node {
     box.style.height = `${h}px`;
     box.style.overflow = "visible";
     box.style.pointerEvents = "none";
-    box.style.filter = `blur(${Math.round(Math.min(w, h) * 0.04)}px)`;
+    // No CSS blur() on the box. The lobes' own radial gradients already fade to
+    // transparent, so the filter softened nothing a viewer can see (mean pixel
+    // difference 0.25 of 255 on a real film) while costing about a third of every
+    // frame's render time on the software compositor (585 -> 385 ms, 12 Nov 2026).
     const stop = Math.round(58 * this.spread);
     const lobe = (color, size, left, top, opacity) => {
       const el = document.createElement("div");
@@ -1003,6 +1076,370 @@ class ParticleFieldNode extends Node {
   }
 }
 
+// ── Interface primitives — what a product film is made of ────────────────────
+// Added after the 11 Nov 2026 study against a polished product film
+// (artifacts/reference-motion-so/plan.html): its story is a prompt box
+// that types, labelled cursors that travel and click, status pills, and a
+// line whose last two words are a different colour. None of that could be
+// drawn from rects and text without the model hand-building every glyph.
+
+// Types `spans` on one at a time, `rate` characters a second from `start`.
+// Visibility, not opacity: a gradient run is painted with background-clip
+// on its parent, and a child with its own opacity leaves that clip.
+// `carets[i]` is the bar shown after character i; the last one keeps
+// blinking. Everything is a timeline tween, so a seek is deterministic.
+function _typeOn(masterTl, spans, carets, start, rate, blink) {
+  const step = 1 / Math.max(1, rate);
+  const n = spans.length;
+  for (let i = 0; i < n; i++) {
+    const t = start + i * step;
+    masterTl.set(spans[i], { visibility: "visible" }, t);
+    const c = carets[i];
+    if (!c) continue;
+    if (i < n - 1) {
+      masterTl.set(c, { visibility: "visible" }, t);
+      masterTl.set(c, { visibility: "hidden" }, start + (i + 1) * step);
+    } else {
+      masterTl.set(c, { visibility: "visible" }, t);
+      if (blink) {
+        masterTl.fromTo(c, { opacity: 1 }, { opacity: 0, duration: 0.5, ease: "steps(1)",
+          repeat: -1, yoyo: true, immediateRender: false }, t);
+      }
+    }
+  }
+}
+
+function _caretEl(size, colour) {
+  const holder = document.createElement("span");
+  holder.style.cssText = "display:inline-block;width:0;position:relative;visibility:hidden;";
+  const bar = document.createElement("span");
+  // The holder is a zero-height inline-block, so it sits ON the baseline; the
+  // bar hangs from the baseline UP (bottom:, not top:) — from a little below
+  // it, past the cap height. Anchoring it with top: put it under the text.
+  bar.style.cssText = `position:absolute;left:${Math.round(size * 0.06)}px;bottom:${-Math.round(size * 0.18)}px;`
+    + `width:${Math.max(2, Math.round(size * 0.07))}px;height:${Math.round(size * 0.95)}px;background:${colour};`;
+  holder.appendChild(bar);
+  return holder;
+}
+
+function _gradientCss(g) {
+  const stops = g.stops.slice().sort((a, b) => a.pos - b.pos)
+    .map(s => `${s.color} ${Math.round(s.pos * 100)}%`).join(", ");
+  return `linear-gradient(90deg, ${stops})`;
+}
+
+// Cursor — a labelled pointer. `position` is where the pointer's TIP starts;
+// `path` is a list of moves {at, to:[x,y], duration, easing, click}. A click
+// draws a ring and presses the arrow. Times are scene-local like every other
+// block (the resolver shifts them).
+class CursorNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.label = props.label || "";
+    this.color = props.color || "#C96442";
+    this.size  = props.size  || 44;
+    this.path  = Array.isArray(props.path) ? props.path : [];
+  }
+  initDOM(box) {
+    const s = this.size;
+    box.style.transform = "";
+    box.style.left = "0px"; box.style.top = "0px"; box.style.width = "0px"; box.style.height = "0px";
+    const ring = document.createElement("div");
+    ring.style.cssText = `position:absolute;left:${-s * 0.6}px;top:${-s * 0.6}px;width:${s * 1.2}px;height:${s * 1.2}px;`
+      + `border-radius:50%;border:${Math.max(2, Math.round(s * 0.06))}px solid ${this.color};opacity:0;`;
+    box.appendChild(ring);
+    const NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("width", String(s)); svg.setAttribute("height", String(s));
+    svg.style.cssText = "position:absolute;left:0;top:0;overflow:visible;filter:drop-shadow(0 2px 3px rgba(0,0,0,0.25));";
+    const p = document.createElementNS(NS, "path");
+    p.setAttribute("d", "M1 1 L1 19 L5.6 14.8 L8.8 22 L12.2 20.5 L9 13.4 L15.2 13.4 Z");
+    p.setAttribute("fill", this.color); p.setAttribute("stroke", "#FFFFFF");
+    p.setAttribute("stroke-width", "1.5"); p.setAttribute("stroke-linejoin", "round");
+    svg.appendChild(p); box.appendChild(svg);
+    if (this.label) {
+      const tag = document.createElement("div");
+      tag.textContent = this.label;
+      tag.style.cssText = `position:absolute;left:${Math.round(s * 0.5)}px;top:${Math.round(s * 0.62)}px;`
+        + `background:${this.color};color:#FFFFFF;font:600 ${Math.round(s * 0.34)}px/1 var(--motion-body-font, Inter, sans-serif);`
+        + `padding:${Math.round(s * 0.11)}px ${Math.round(s * 0.3)}px;border-radius:999px;white-space:nowrap;`
+        + "box-shadow:0 2px 6px rgba(0,0,0,0.18);";
+      box.appendChild(tag);
+    }
+    this._ring = ring; this._arrow = svg;
+  }
+  registerContentAnimation(masterTl) {
+    let x = this.position[0], y = this.position[1];
+    for (const seg of this.path) {
+      const to = Array.isArray(seg.to) && seg.to.length === 2 ? seg.to : [x, y];
+      const dur = Math.max(0.05, seg.duration || 0.7), at = seg.at || 0;
+      masterTl.fromTo(this._host, { x, y }, { x: to[0], y: to[1], duration: dur,
+        ease: seg.easing || "power3.inOut", immediateRender: false }, at);
+      x = to[0]; y = to[1];
+      if (seg.click) {
+        const t = at + dur;
+        masterTl.fromTo(this._ring, { opacity: 0.7, scale: 0.3 }, { opacity: 0, scale: 1.6,
+          duration: 0.42, ease: "power2.out", immediateRender: false }, t);
+        masterTl.fromTo(this._arrow, { scale: 1 }, { scale: 0.82, duration: 0.07, ease: "power1.inOut",
+          yoyo: true, repeat: 1, transformOrigin: "0 0", immediateRender: false }, t);
+      }
+    }
+  }
+}
+
+// UIPill — a status chip: an optional coloured dot or a green check, then a label.
+class UIPillNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.label    = String(props.label || "");
+    this.dot      = props.dot || null;
+    this.check    = !!props.check;
+    this.fontSize = props.font_size || 28;
+    this.fill     = props.fill || "#FFFFFF";
+    this.ink      = props.ink  || "#111111";
+    this.border   = props.border || "rgba(0,0,0,0.07)";
+  }
+  initDOM(box) {
+    const fs = this.fontSize;
+    box.style.transform = `translate(${-this.anchor[0] * 100}%, ${-this.anchor[1] * 100}%)`;
+    box.style.display = "inline-flex"; box.style.alignItems = "center";
+    box.style.gap = `${Math.round(fs * 0.45)}px`;
+    box.style.padding = `${Math.round(fs * 0.5)}px ${Math.round(fs * 0.95)}px`;
+    box.style.borderRadius = "999px"; box.style.background = this.fill;
+    box.style.border = `1px solid ${this.border}`;
+    box.style.boxShadow = "0 1px 2px rgba(0,0,0,0.06), 0 10px 28px rgba(0,0,0,0.09)";
+    box.style.whiteSpace = "nowrap"; box.style.color = this.ink;
+    box.style.font = `500 ${fs}px/1 var(--motion-body-font, Inter, -apple-system, sans-serif)`;
+    if (this.check) {
+      const NS = "http://www.w3.org/2000/svg";
+      const svg = document.createElementNS(NS, "svg");
+      svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("width", String(Math.round(fs * 0.95)));
+      svg.setAttribute("height", String(Math.round(fs * 0.95)));
+      const p = document.createElementNS(NS, "path");
+      p.setAttribute("d", "M4 12.5 L9.5 18 L20 6.5"); p.setAttribute("fill", "none");
+      p.setAttribute("stroke", "#16A34A"); p.setAttribute("stroke-width", "3.2");
+      p.setAttribute("stroke-linecap", "round"); p.setAttribute("stroke-linejoin", "round");
+      svg.appendChild(p); box.appendChild(svg);
+    } else if (this.dot) {
+      const d = document.createElement("span");
+      d.style.cssText = `display:inline-block;width:${Math.round(fs * 0.4)}px;height:${Math.round(fs * 0.4)}px;`
+        + `border-radius:50%;background:${this.dot};`;
+      box.appendChild(d);
+    }
+    const label = document.createElement("span"); label.textContent = this.label; box.appendChild(label);
+  }
+}
+
+// UIInput — a prompt box: placeholder, text that types itself, a send button
+// that goes from grey to ink when the message is sent.
+class UIInputNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.width  = props.width  || 900;
+    this.height = props.height || 220;
+    this.text = String(props.text || "");
+    this.placeholder = String(props.placeholder || "");
+    this.fontSize = props.font_size || Math.round(this.height * 0.17);
+    this.fill = props.fill || "#FFFFFF";
+    this.ink = props.ink || "#111111";
+    this.revealStart = props.reveal_start || 0;
+    this.typeRate = props.type_rate || 14;
+    this.sendAt = props.send_at !== undefined ? props.send_at : null;
+  }
+  initDOM(box) {
+    const w = this.width, h = this.height, fs = this.fontSize;
+    box.style.transform = "";
+    box.style.left = `${-w * this.anchor[0]}px`; box.style.top = `${-h * this.anchor[1]}px`;
+    box.style.width = `${w}px`; box.style.height = `${h}px`;
+    box.style.background = this.fill; box.style.borderRadius = `${Math.round(h * 0.13)}px`;
+    box.style.border = "1px solid rgba(0,0,0,0.07)";
+    box.style.boxShadow = "0 1px 2px rgba(0,0,0,0.05), 0 18px 48px rgba(0,0,0,0.08)";
+    box.style.font = `400 ${fs}px/1.3 var(--motion-body-font, Inter, -apple-system, sans-serif)`;
+    const pad = Math.round(h * 0.14);
+    const ph = document.createElement("div");
+    ph.textContent = this.placeholder;
+    ph.style.cssText = `position:absolute;left:${pad}px;top:${pad}px;color:#9CA3AF;white-space:pre;`;
+    box.appendChild(ph);
+    const typed = document.createElement("div");
+    typed.style.cssText = `position:absolute;left:${pad}px;top:${pad}px;right:${pad}px;color:${this.ink};white-space:pre-wrap;`;
+    this._spans = []; this._carets = [];
+    for (const ch of Array.from(this.text)) {
+      const s = document.createElement("span"); s.textContent = ch; s.style.visibility = "hidden"; s.style.whiteSpace = "pre";
+      typed.appendChild(s); this._spans.push(s);
+      const c = _caretEl(fs, this.ink); typed.appendChild(c); this._carets.push(c);
+    }
+    box.appendChild(typed);
+    const d = Math.round(h * 0.3);
+    const btn = document.createElement("div");
+    btn.style.cssText = `position:absolute;right:${pad}px;bottom:${pad}px;width:${d}px;height:${d}px;border-radius:50%;`
+      + "background:#A1A1AA;display:flex;align-items:center;justify-content:center;";
+    const NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("width", String(Math.round(d * 0.5)));
+    svg.setAttribute("height", String(Math.round(d * 0.5)));
+    const p = document.createElementNS(NS, "path");
+    p.setAttribute("d", "M12 19 V5 M5.5 11.5 L12 5 L18.5 11.5"); p.setAttribute("fill", "none");
+    p.setAttribute("stroke", "#FFFFFF"); p.setAttribute("stroke-width", "2.6");
+    p.setAttribute("stroke-linecap", "round"); p.setAttribute("stroke-linejoin", "round");
+    svg.appendChild(p); btn.appendChild(svg); box.appendChild(btn);
+    this._ph = ph; this._btn = btn;
+  }
+  registerContentAnimation(masterTl) {
+    if (this._spans.length) {
+      masterTl.set(this._ph, { visibility: "hidden" }, this.revealStart);
+      _typeOn(masterTl, this._spans, this._carets, this.revealStart, this.typeRate, true);
+    }
+    if (this.sendAt !== null) {
+      masterTl.fromTo(this._btn, { backgroundColor: "#A1A1AA" }, { backgroundColor: this.ink,
+        duration: 0.18, ease: "power1.out", immediateRender: false }, this.sendAt);
+    }
+  }
+}
+
+// UIChecklist — rows of work in progress: a coloured dot, a label, a quieter
+// sub-line and a thin underline that fills while the row "works". Each item
+// is {label, sub?, color?, at, fill?} (at: scene-local seconds it appears).
+class UIChecklistNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.items = Array.isArray(props.items) ? props.items : [];
+    this.width = props.width || 760;
+    this.fontSize = props.font_size || 34;
+    this.ink = props.ink || "#111111";
+    this.gap = props.row_gap !== undefined ? props.row_gap : Math.round(this.fontSize * 0.9);
+  }
+  initDOM(box) {
+    const fs = this.fontSize;
+    box.style.transform = `translate(${-this.anchor[0] * 100}%, ${-this.anchor[1] * 100}%)`;
+    box.style.width = `${this.width}px`;
+    box.style.display = "flex"; box.style.flexDirection = "column"; box.style.gap = `${this.gap}px`;
+    box.style.font = `600 ${fs}px/1.2 var(--motion-body-font, Inter, -apple-system, sans-serif)`;
+    box.style.color = this.ink;
+    this._rows = [];
+    const colours = ["#E0533C", "#3B82F6", "#D946A8", "#10B981", "#F59E0B"];
+    this.items.forEach((it, i) => {
+      const colour = it.color || colours[i % colours.length];
+      const row = document.createElement("div");
+      row.style.cssText = "position:relative;display:flex;align-items:flex-start;gap:" + Math.round(fs * 0.5) + "px;opacity:0;padding-bottom:" + Math.round(fs * 0.3) + "px;";
+      const dot = document.createElement("span");
+      dot.style.cssText = `flex:none;margin-top:${Math.round(fs * 0.32)}px;width:${Math.round(fs * 0.3)}px;height:${Math.round(fs * 0.3)}px;border-radius:50%;background:${colour};`;
+      const col = document.createElement("div");
+      const label = document.createElement("div"); label.textContent = String(it.label || "");
+      col.appendChild(label);
+      if (it.sub) {
+        const sub = document.createElement("div"); sub.textContent = String(it.sub);
+        sub.style.cssText = `font-weight:400;font-size:${Math.round(fs * 0.62)}px;color:#6B7280;margin-top:${Math.round(fs * 0.12)}px;`;
+        col.appendChild(sub);
+      }
+      const line = document.createElement("div");
+      line.style.cssText = `position:absolute;left:${Math.round(fs * 0.8)}px;right:0;bottom:0;height:${Math.max(2, Math.round(fs * 0.07))}px;background:${colour};transform-origin:0 50%;transform:scaleX(0);opacity:0.85;`;
+      row.appendChild(dot); row.appendChild(col); row.appendChild(line); box.appendChild(row);
+      this._rows.push({ row, line, at: it.at || 0, fill: it.fill || 1.6 });
+    });
+  }
+  registerContentAnimation(masterTl) {
+    for (const r of this._rows) {
+      masterTl.fromTo(r.row, { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out", immediateRender: false }, r.at);
+      masterTl.fromTo(r.line, { scaleX: 0 }, { scaleX: 1, duration: r.fill, ease: "power1.inOut", immediateRender: false }, r.at + 0.2);
+    }
+  }
+}
+
+// UIWindow — an application window: title bar, a content area for its
+// children (positions are relative to the window's centre, like a panel's),
+// and a scrubber whose thumb travels from 0 to `progress` between `play_at`
+// and `play_at + play_for`.
+class UIWindowNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.width = props.width || 900; this.height = props.height || 620;
+    this.title = String(props.title || "");
+    this.timecode = String(props.timecode || "");
+    this.fill = props.fill || "#FFFFFF";
+    this.contentFill = props.content_fill || "#F3EFE6";
+    this.scrubber = props.scrubber !== false;
+    this.progress = props.progress !== undefined ? props.progress : 1;
+    this.playAt = props.play_at || 0; this.playFor = props.play_for || 2;
+  }
+  initDOM(box) {
+    const w = this.width, h = this.height, bar = Math.round(h * 0.075), foot = this.scrubber ? Math.round(h * 0.11) : 0;
+    box.style.transform = "";
+    box.style.left = `${-w * this.anchor[0]}px`; box.style.top = `${-h * this.anchor[1]}px`;
+    box.style.width = `${w}px`; box.style.height = `${h}px`;
+    box.style.background = this.fill; box.style.borderRadius = `${Math.round(h * 0.03)}px`;
+    box.style.border = "1px solid rgba(0,0,0,0.07)";
+    box.style.boxShadow = "0 2px 4px rgba(0,0,0,0.05), 0 28px 70px rgba(0,0,0,0.12)";
+    box.style.overflow = "hidden";
+    box.style.font = `500 ${Math.round(bar * 0.42)}px/1 var(--motion-body-font, Inter, -apple-system, sans-serif)`;
+    const head = document.createElement("div");
+    head.style.cssText = `position:absolute;left:0;top:0;right:0;height:${bar}px;display:flex;align-items:center;gap:${Math.round(bar * 0.2)}px;padding:0 ${Math.round(bar * 0.4)}px;color:#9CA3AF;`;
+    for (let i = 0; i < 3; i++) {
+      const d = document.createElement("span");
+      d.style.cssText = `width:${Math.round(bar * 0.2)}px;height:${Math.round(bar * 0.2)}px;border-radius:50%;background:#D4D4D8;`;
+      head.appendChild(d);
+    }
+    const t = document.createElement("span"); t.textContent = this.title; t.style.marginLeft = `${Math.round(bar * 0.2)}px`; head.appendChild(t);
+    const content = document.createElement("div");
+    content.style.cssText = `position:absolute;left:${Math.round(w * 0.02)}px;right:${Math.round(w * 0.02)}px;top:${bar}px;bottom:${foot + Math.round(h * 0.02)}px;background:${this.contentFill};border-radius:${Math.round(h * 0.02)}px;`;
+    box.appendChild(head); box.appendChild(content);
+    if (this.scrubber) {
+      const trackW = w - 2 * Math.round(w * 0.04) - (this.timecode ? Math.round(bar * 1.6) : 0);
+      const track = document.createElement("div");
+      track.style.cssText = `position:absolute;left:${Math.round(w * 0.04)}px;bottom:${Math.round(foot * 0.45)}px;width:${trackW}px;height:2px;background:#E4E4E7;`;
+      const thumb = document.createElement("div");
+      const tw = Math.max(2, Math.round(bar * 0.06)), th = Math.round(foot * 0.5);
+      thumb.style.cssText = `position:absolute;left:0;top:${-Math.round(th / 2) + 1}px;width:${tw}px;height:${th}px;background:#111111;`;
+      track.appendChild(thumb); box.appendChild(track);
+      if (this.timecode) {
+        const tc = document.createElement("div"); tc.textContent = this.timecode;
+        tc.style.cssText = `position:absolute;right:${Math.round(w * 0.04)}px;bottom:${Math.round(foot * 0.45) - 6}px;color:#9CA3AF;`;
+        box.appendChild(tc);
+      }
+      this._thumb = thumb; this._trackW = trackW;
+    }
+  }
+  registerContentAnimation(masterTl) {
+    if (this._thumb) {
+      masterTl.fromTo(this._thumb, { x: 0 }, { x: this._trackW * this.progress, duration: Math.max(0.05, this.playFor),
+        ease: "none", immediateRender: false }, this.playAt);
+    }
+  }
+}
+
+// UISwatches — a row of palette chips, each a small card of coloured dots,
+// popping in one after another from `at`.
+class UISwatchesNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.groups = Array.isArray(props.groups) ? props.groups : [];
+    this.dot = props.dot_size || 30; this.at = props.at || 0; this.stagger = props.stagger !== undefined ? props.stagger : 0.25;
+  }
+  initDOM(box) {
+    const d = this.dot;
+    box.style.transform = `translate(${-this.anchor[0] * 100}%, ${-this.anchor[1] * 100}%)`;
+    box.style.display = "flex"; box.style.gap = `${Math.round(d * 0.7)}px`; box.style.whiteSpace = "nowrap";
+    this._chips = [];
+    for (const colours of this.groups) {
+      const chip = document.createElement("div");
+      chip.style.cssText = `display:flex;gap:${Math.round(d * 0.3)}px;padding:${Math.round(d * 0.45)}px ${Math.round(d * 0.6)}px;`
+        + "background:#FFFFFF;border:1px solid rgba(0,0,0,0.07);border-radius:" + Math.round(d * 0.55) + "px;"
+        + "box-shadow:0 1px 2px rgba(0,0,0,0.06),0 10px 26px rgba(0,0,0,0.09);opacity:0;";
+      for (const c of (Array.isArray(colours) ? colours : [])) {
+        const dot = document.createElement("span");
+        dot.style.cssText = `width:${d}px;height:${d}px;border-radius:${Math.round(d * 0.3)}px;background:${c};`;
+        chip.appendChild(dot);
+      }
+      box.appendChild(chip); this._chips.push(chip);
+    }
+  }
+  registerContentAnimation(masterTl) {
+    this._chips.forEach((chip, i) => {
+      masterTl.fromTo(chip, { opacity: 0, scale: 0.8, y: 10 }, { opacity: 1, scale: 1, y: 0, duration: 0.45,
+        ease: "back.out(1.6)", immediateRender: false }, this.at + i * this.stagger);
+    });
+  }
+}
+
 // ── Node Factory ──────────────────────────────────────────────────────────────
 function createNodeFromSpec(nodeData) {
   if (!nodeData) return null;
@@ -1017,6 +1454,12 @@ function createNodeFromSpec(nodeData) {
   else if (type === "light_field")                           node = new LightFieldNode(nodeData);
   else if (type === "depth_layer")                           node = new DepthLayerNode(nodeData);
   else if (type === "icon")                                  node = new IconNode(nodeData);
+  else if (type === "cursor")                                node = new CursorNode(nodeData);
+  else if (type === "ui_pill" || type === "pill")            node = new UIPillNode(nodeData);
+  else if (type === "ui_input")                              node = new UIInputNode(nodeData);
+  else if (type === "ui_checklist")                          node = new UIChecklistNode(nodeData);
+  else if (type === "ui_window")                             node = new UIWindowNode(nodeData);
+  else if (type === "ui_swatches")                           node = new UISwatchesNode(nodeData);
   else if (type === "orb")                                   node = new OrbNode(nodeData);
   else if (type === "spline_tree")                           node = new SplineTreeNode(nodeData);
   else if (type === "particle_field")                        node = new ParticleFieldNode(nodeData);
@@ -1046,6 +1489,12 @@ window.LightFieldNode   = LightFieldNode;
 window.DepthLayerNode   = DepthLayerNode;
 window.IconNode         = IconNode;
 window.OrbNode          = OrbNode;
+window.CursorNode       = CursorNode;
+window.UIPillNode       = UIPillNode;
+window.UIInputNode      = UIInputNode;
+window.UIChecklistNode  = UIChecklistNode;
+window.UIWindowNode     = UIWindowNode;
+window.UISwatchesNode   = UISwatchesNode;
 window.SplineTreeNode   = SplineTreeNode;
 window.ParticleFieldNode = ParticleFieldNode;
 window.createNodeFromSpec = createNodeFromSpec;

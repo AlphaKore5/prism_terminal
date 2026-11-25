@@ -213,3 +213,35 @@ def _child_env() -> dict:
     elif getattr(sys, "frozen", False):  # frozen with nothing stashed: drop it
         env.pop("LD_LIBRARY_PATH", None)
     return env
+
+
+_WARM_FONTS_JS = """async () => {
+  // The font stylesheet is a network link: until it has loaded there is no @font-face to
+  // ask, and document.fonts.load() quietly matches nothing.
+  await Promise.all([...document.querySelectorAll('link[rel=stylesheet]')].map(l => l.sheet ? 1 :
+    new Promise(r => { l.addEventListener('load', r); l.addEventListener('error', r); setTimeout(r, 6000); })));
+  const jobs = [];
+  for (const el of document.querySelectorAll('body *')) {
+    const text = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim();
+    if (!text) continue;
+    const cs = getComputedStyle(el);
+    jobs.push(document.fonts.load(`${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`, text).catch(() => []));
+  }
+  await Promise.race([Promise.all(jobs), new Promise(r => setTimeout(r, 8000))]);
+  await document.fonts.ready;
+  return jobs.length;
+}"""
+
+
+def warm_fonts(page) -> int:
+    """Load, before any frame is captured, every web-font slice the page's text
+    will use. `document.fonts.ready` resolves as soon as nothing has asked for a
+    font yet, and a family such as Fraunces loads lazily by glyph range once its
+    text is first drawn: the frame that first uses a slice is captured with the
+    text still invisible (found 13 Nov 2026: a settled frame of a finished film
+    came back blank on three runs in four). Never raises; returns how many text
+    runs it asked about."""
+    try:
+        return int(page.evaluate(_WARM_FONTS_JS) or 0)
+    except Exception:  # noqa: BLE001
+        return 0

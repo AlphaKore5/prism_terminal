@@ -39,7 +39,10 @@ _PULL_FACTOR = 1.0 / 1.15
 _MACRO_ZOOM = 1.6
 _ORBIT_TILT_DEG = 3.0
 _PARALLAX_DRIFT_PX = 60.0
-ZOOM_MIN, ZOOM_MAX = 0.5, 3.0
+# 12, not 3: the reference film of 11 Nov 2026 pushes about 8x into one word,
+# and text, shapes and UI are vector — they stay crisp. A raster `image` does
+# not, so an author zooming past ~3x onto a photo should aim at its subject.
+ZOOM_MIN, ZOOM_MAX = 0.5, 12.0
 
 
 def safe_area(width: int, height: int) -> Dict[str, Any]:
@@ -157,9 +160,48 @@ def _resolve_target(target: Any, world_pos: Dict[str, Tuple[float, float]],
     return fallback
 
 
+def keep_in_view(pos: Tuple[float, float], zoom: float, box: Sequence[float],
+                 width: int, height: int, margin: Optional[float] = None
+                 ) -> Tuple[Tuple[float, float], float]:
+    """The camera state nearest the wanted one from which `box` (left, top,
+    right, bottom, in authored space) is entirely visible INSIDE the safe
+    area (see safe_area(): a vertical frame keeps its top 11 % and bottom
+    20 % clear for platform chrome). `margin`, when given, replaces the safe
+    area with a plain margin (a fraction of each dimension) on every side.
+
+    Zoom is capped at the most the box allows (never below 1.0 — a box wider
+    than the frame at 1x is the text-fit pass's business, not a reason to
+    pull out); the centre is clamped into the range that keeps the box in
+    view, or put on the box's own centre when no such range exists."""
+    l, t, r, b = (float(v) for v in box)
+    bw, bh = max(0.0, r - l), max(0.0, b - t)
+    if bw <= 0 or bh <= 0:
+        return pos, zoom
+    if margin is not None:
+        ml = mr = width * margin
+        mt = mb = height * margin
+    else:
+        zone = safe_area(width, height)
+        ml, mr = float(zone["left"]), float(width - zone["right"])
+        mt, mb = float(zone["top"]), float(height - zone["bottom"])
+    zmax = max(1.0, min(width / (bw + ml + mr), height / (bh + mt + mb)))
+    z = min(zoom, zmax)
+    hw, hh = width / (2.0 * z), height / (2.0 * z)
+
+    def axis(c, lo_edge, hi_edge, half, m_lo, m_hi):
+        # the view spans [c-half, c+half]; it must contain [lo_edge-m_lo, hi_edge+m_hi]
+        low, high = hi_edge + m_hi - half, lo_edge - m_lo + half
+        if low > high:
+            return (lo_edge - m_lo + hi_edge + m_hi) / 2.0
+        return min(max(c, low), high)
+
+    return (axis(pos[0], l, r, hw, ml, mr), axis(pos[1], t, b, hh, mt, mb)), z
+
+
 def compile_tracks(scenes: Sequence[Dict[str, Any]], width: int, height: int,
                    world_pos: Dict[str, Tuple[float, float]],
-                   authored: Optional[List[Dict[str, Any]]] = None
+                   authored: Optional[List[Dict[str, Any]]] = None,
+                   content_boxes: Optional[Sequence[Optional[Sequence[float]]]] = None
                    ) -> Optional[List[Dict[str, Any]]]:
     """One continuous `camera.tracks` list from the scenes' shots.
 
@@ -193,7 +235,7 @@ def compile_tracks(scenes: Sequence[Dict[str, Any]], width: int, height: int,
         "zoom": round(zoom, 4), "rotation": round(rot, 3), "_shot": "open",
     }]
     orbit_sign = 1.0
-    for scene in scenes:
+    for scene_index, scene in enumerate(scenes):
         shot = scene.get("shot")
         if not isinstance(shot, dict):
             # A scene that names no shot must not inherit a corner: the
@@ -266,6 +308,16 @@ def compile_tracks(scenes: Sequence[Dict[str, Any]], width: int, height: int,
             duration = seconds * 0.85
             easing = easing or "power2.inOut"
         new_zoom = max(ZOOM_MIN, min(ZOOM_MAX, new_zoom))
+        # The scene's copy must still be in frame where the camera settles.
+        # Shots compound — each `push` multiplies the zoom the last one left —
+        # and a `hold` inherits it, so a model-written film ended on a 1.75x
+        # camera filming a last scene it had composed for 1x: the name was
+        # off the top and the phone number off the left (12 Nov 2026).
+        # `crop: true` on the shot means the close-up is deliberate.
+        if (content_boxes is not None and scene_index < len(content_boxes)
+                and content_boxes[scene_index] and not shot.get("crop")):
+            new_pos, new_zoom = keep_in_view(new_pos, new_zoom, content_boxes[scene_index],
+                                             width, height)
         delay = 0.0
         if shot.get("delay") is not None:
             delay = min(max(0.0, seconds - 0.05), _num(shot["delay"], 0.0))

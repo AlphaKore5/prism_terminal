@@ -22,6 +22,8 @@ import json
 import difflib
 import requests
 
+from . import ai_client as _ai
+
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # Directories that are never worth descending into.
@@ -81,17 +83,21 @@ Rules:
   in "folders", leave "filename" null. When in doubt, null.
 
 Description: {desc}"""
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-    }
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
-    rj = resp.json()
-    if "choices" not in rj:
-        return None
-    text = rj["choices"][0]["message"]["content"]
+    if _ai.active():
+        text = _ai.chat("classify", prompt, addon="core", feature="pathfinder",
+                        temperature=0, timeout=30, model_hint=model)
+    else:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+        }
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+        rj = resp.json()
+        if "choices" not in rj:
+            return None
+        text = rj["choices"][0]["message"]["content"]
     s, e = text.find("{"), text.rfind("}") + 1
     if s == -1 or e <= s:
         return None

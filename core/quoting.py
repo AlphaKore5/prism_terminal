@@ -455,6 +455,12 @@ class Request:
     item: RateItem
     quantity: Decimal | None
     evidence: str = ""              # the line of the mail it was read from
+    # True for every code-matched Request (find_requests): a code is exact,
+    # there is no matching confidence to speak of. False is only possible
+    # from find_free_text_requests() below, where `item` is a fuzzy guess
+    # at a description, not an exact code -- the UI highlights those rows
+    # so a person checks the ROW, not only the quantity beside it.
+    match_confident: bool = True
 
     @property
     def confident(self) -> bool:
@@ -557,6 +563,79 @@ def is_confident(matches: list[Match], margin: float = 1.6) -> bool:
     if len(matches) == 1:
         return matches[0].score > 0
     return matches[0].score >= matches[1].score * margin
+
+
+# ── an itemised list in the customer's own words, no catalogue code ──────────
+# find_requests() above only ever sees a code -- "items without a code are
+# never matched here" is its own, correct, original design. But a customer
+# who writes a real catalogue number is the minority case: most write a
+# short list in their own words, one line per item, a quantity beside each
+# -- "SS Locker (4 Comp) :- 10", "SS Lab Modular (L shape) :-13", and so on.
+# Found live, 4 Nov 2026: an 8-item inquiry shaped exactly like that went
+# through as ONE quotation line (qty 1, a generic description), because
+# nothing between the mail and the quotation screen ever split a free-text
+# list into separate lines -- the fuzzy match_item() the single-item screen
+# falls back to takes one query string and returns one best-guess row; nine
+# genuinely different products collapsed into a single sentence summarising
+# "what they want" before match_item() ever saw them.
+#
+# This is the free-text counterpart of find_requests(): split the text into
+# "<description> <separator> <quantity>" lines, then run EACH description
+# through the same match_item() every single-item quotation already uses,
+# at the same confidence bar (is_confident() plus "a lone candidate needs
+# at least two shared words" -- confident_match()'s own rule in
+# addons/inquiry/quotation.py, inlined here since it is a general
+# matching-confidence rule, not something specific to that screen).
+#
+# A description that matches nothing, or matches too weakly to trust, is
+# never silently dropped -- it comes back in `unmatched` so the person
+# opening the quotation can see a line of the mail Prism could not price,
+# rather than a quotation that is quietly short by one item.
+_FREE_TEXT_ITEM = re.compile(
+    r"(?P<desc>[A-Za-z][A-Za-z0-9 ()/,.&+'\-]{3,120}?)"
+    r"\s*(?:[:\-–]{1,2}|\bqty\.?\s*|\bquantity\s*[:\-]?\s*)\s*"
+    r"(?P<qty>\d[\d,]*(?:\.\d+)?)"
+    r"\s*(?:" + _QTY_UNITS + r")?\b", re.I)
+
+
+def split_free_text_lines(text: str) -> list[tuple[str, Decimal, str]]:
+    """Every "<description> <separator> <quantity>" the text contains, in
+    the order written -- (description, quantity, the matched text itself as
+    evidence). Pure pattern splitting, no rate-list involved: match_item()
+    is a separate step so this stays testable on its own, the same
+    separation find_requests()/_quantity_near() already keep."""
+    out: list[tuple[str, Decimal, str]] = []
+    for m in _FREE_TEXT_ITEM.finditer(text or ""):
+        desc = m.group("desc").strip(" \t-:–")
+        qty = to_decimal(m.group("qty"))
+        if len(desc) < 3 or qty <= 0:
+            continue
+        out.append((desc, qty, m.group(0).strip()))
+    return out
+
+
+def find_free_text_requests(
+        text: str, items: list[RateItem]) -> tuple[list[Request], list[str]]:
+    """The free-text counterpart of find_requests() -- see the module note
+    above. Returns (requests, unmatched): `requests` has one Request per
+    line that matched a rate-list row with reasonable confidence
+    (match_confident=True) or without (match_confident=False, never
+    dropped -- the UI highlights it instead); `unmatched` is the raw
+    evidence text of every line that matched NO row on the list at all,
+    for the caller to show as its own warning rather than silently losing
+    the line."""
+    requests: list[Request] = []
+    unmatched: list[str] = []
+    for desc, qty, evidence in split_free_text_lines(text):
+        matches = match_item(desc, items, limit=3)
+        if not matches:
+            unmatched.append(evidence)
+            continue
+        confident = is_confident(matches) and (
+            len(matches) > 1 or len(matches[0].matched) >= 2)
+        requests.append(Request(matches[0].item, qty, evidence=evidence,
+                                match_confident=confident))
+    return requests, unmatched
 
 
 # ── the cost sheet, for made-to-drawing work ─────────────────────────────────

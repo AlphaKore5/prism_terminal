@@ -14,6 +14,7 @@ import re
 import requests
 
 from . import agents as A
+from . import ai_client as _ai
 from . import config as C
 from . import skills as SK
 from . import ui
@@ -136,7 +137,8 @@ def _model_is_gone(status: int, body: dict) -> bool:
 
 
 def groq_chat(api_key: str, model: str, prompt: str, *, temperature: float = 0.3,
-              timeout: int = 60, retries: int = 1, json_mode: bool = False) -> str:
+              timeout: int = 60, retries: int = 1, json_mode: bool = False,
+              role: str = "planner", addon: str = "core", feature: str = "") -> str:
     """One Groq completion, with the two failures a daily user actually hits.
 
     Rate limits are retried after the wait Groq asks for; a retired model falls
@@ -152,7 +154,14 @@ def groq_chat(api_key: str, model: str, prompt: str, *, temperature: float = 0.3
     error, with a real completion signal instead of a 300s stability guess.
     The prompt must itself mention JSON somewhere or Groq rejects the request;
     Prism's machine-stage prompts already say "reply with only a JSON object".
+
+    When the AI seam is active (core.ai_client) the call goes to Prism's
+    licence server under `role` and the key and model arguments are not used.
     """
+    if _ai.active():
+        return _ai.chat(role, prompt, addon=addon, feature=feature or role,
+                        json_mode=json_mode, temperature=temperature,
+                        timeout=timeout, retries=retries, model_hint=model)
     headers = {"Authorization": f"Bearer {api_key}",
                "Content-Type": "application/json"}
     last = ""
@@ -374,6 +383,8 @@ def apply_make_guardrail(query: str, routing: dict, agents: dict) -> list[str]:
             continue                      # user has no tool for this stage
         if not _mentions(q, terms):
             continue
+        if stage == "media" and _PICTURE_FOR_VIDEO.search(q):
+            continue                      # "an image for my reel": a picture
         data = routing.get(stage) or {}
         if data.get("needed") and data.get("questions"):
             continue                      # already on — nothing to force
@@ -475,6 +486,74 @@ def apply_script_guardrail(routing: dict, agents: dict) -> bool:
         "itself — output the words only; a later stage builds it."
     ]}
     return True
+
+
+# ── A video request is a pipeline, never one picture ─────────────────────────
+# "make an Instagram reel" came back as a single image (Visual.png) because the
+# make-step guardrail saw the word "image"/"picture" in the plan, or the person
+# had no video tool picked, and nothing said that a reel needs a SCRIPT and a
+# renderer. Decided here, in code, for the same reason the other guardrails
+# are: this is not a judgement call worth leaving to how a model reads the
+# brief that day.
+_VIDEO_TERMS = [
+    "reel", "video", "animation", "animated", "animate", "motion graphic",
+    "motion graphics", "short video", "short-form", "shorts", "tiktok",
+    "promo", "teaser", "explainer", "film", "ad film",
+    "instagram story", "story ad",
+]
+# "commercial" alone is NOT a video: engineering and sales customers say
+# "commercial site / building / kitchen" all day, and the bare word turned
+# every such question into a script + video pipeline (~1,600 credits,
+# 19 Nov 2026). Only the advertising sense counts: a TV / 30-second / video
+# commercial, "a commercial for ...", a commercial ad or spot.
+_AD_COMMERCIAL = re.compile(
+    r"\b(?:tv|television|video|radio|ad|advert|\d+[- ]?(?:second|sec|s))\s+commercials?\b"
+    r"|\bcommercials?\s+(?:ad|advert|spot|video|film)s?\b"
+    r"|\b(?:a|an|the|our|my)\s+commercial\s+(?:for|about|on)\b")
+# "an image for my reel", "a thumbnail for the video": the picture is the
+# deliverable, the video is only where it goes.
+_PICTURE_FOR_VIDEO = re.compile(
+    r"\b(?:image|images|picture|pictures|photo|poster|logo|thumbnail|cover|"
+    r"banner|icon|graphic)s?\b[^.\n]{0,40}?\b(?:for|of)\s+(?:my|a|an|the|our)\s+"
+    r"(?:\w+\s+){0,2}(?:reel|video|film|short|story)s?\b")
+_SEPARATE_PICTURE_TERMS = ["poster", "logo", "thumbnail", "banner", "icon",
+                           "sticker", "wallpaper", "mockup", "cover image"]
+
+
+def is_video_request(query: str) -> bool:
+    q = (query or "").lower()
+    if _PICTURE_FOR_VIDEO.search(q):
+        return False
+    return _mentions(q, _VIDEO_TERMS) or bool(_AD_COMMERCIAL.search(q))
+
+
+def apply_video_guardrail(query: str, routing: dict, agents: dict) -> list[str]:
+    """A reel / video / animation / motion graphic is script -> scenes ->
+    pictures -> render, so: CONTENT writes the script, MEDIA makes the scenes'
+    pictures and films the file. VISUAL is never the only step, and is turned
+    off when MEDIA's own renderer draws the pictures, unless a separate
+    picture (poster, logo, thumbnail) was asked for as well.
+    Returns what it changed, as plain stage names."""
+    if not agents.get("media") or not is_video_request(query):
+        return []
+    changed = []
+    m = routing.get("media") or {}
+    if not (m.get("needed") and m.get("questions")):
+        routing["media"] = {"needed": True, "kind": "video", "questions": [
+            "Make the finished video: draw the scenes from the script, make "
+            "the pictures they need and film it. Original request: "
+            + query.strip()]}
+        changed.append("media")
+    elif m.get("kind") != "video":
+        m["kind"] = "video"
+    v = routing.get("visual")
+    entry = A.AGENT_REGISTRY.get(agents.get("media") or "") or {}
+    if (entry.get("local") and isinstance(v, dict) and v.get("needed")
+            and not _mentions(query.lower(), _SEPARATE_PICTURE_TERMS)):
+        v["needed"] = False
+        v["questions"] = []
+        changed.append("visual off")
+    return changed
 
 
 # Prism Reel's whole house style is icons and typography, drawn in code —
@@ -642,9 +721,11 @@ _STAGE_HELP = {
     "content": "ONLY when the deliverable is a SUBSTANTIAL written piece (full article, essay, long-form "
                "copy, script, documentation). Short text, answers and briefs belong to brains, not here.",
     "visual": "generating images, art, character designs, logos, illustrations.",
-    "media": "generating VIDEO only — footage, animation, reels, AI avatars. "
-             "Voice-over and music are a SEPARATE stage (audio), so a reel that "
-             "needs narration should turn BOTH on, not one.",
+    "media": "making a finished VIDEO file — reels, shorts, animations, motion "
+             "graphics, video ads. It films the scenes from the script handed "
+             "to it and makes the pictures those scenes need itself, so a "
+             "video never needs a VISUAL step. Voice-over is a SEPARATE stage "
+             "(audio) where it exists.",
     "audio": "generating AUDIO only — voice-over, narration, dubbing, music or an "
              "audio explainer. Turn this on alongside media when a video needs a "
              "voice, or alone when the deliverable is sound.",
@@ -1008,8 +1089,8 @@ def build_prompt(query: str, profile: str, agents: dict, attachments: list | Non
         "not, ignore that part) ═══\n"
         f"{brief}\n" if brief else ""
     )
-    return f"""You are the planner of Prism — a desktop app that runs real AI
-tools in a browser, one step after another, and collects what they produce.
+    return f"""You are the planner of Prism — a desktop app that runs a chain of
+AI steps, one after another, and collects what they produce.
 
 {profile_line}{attach_line}These steps are available, in this order. Each one is carried by the tool
 named, and each receives the previous step's answer as its context:
@@ -1020,8 +1101,9 @@ named, and each receives the previous step's answer as its context:
 {premium_rule}- MAKE-STEPS. If the person asks for something to be MADE, the step that
   makes it MUST run — a thinking step only describes it. Map the thing to
   its step:
-    image / logo / art / poster ............ VISUAL
-    video / reel / animation ............... MEDIA
+    image / logo / art / poster ............ VISUAL (pictures only)
+    video / reel / animation / video ad .... CONTENT (the script) then MEDIA
+    post caption / email / short copy ...... BRAINS (CONTENT only if long)
     voice-over / narration / music ......... AUDIO
     slide deck / presentation .............. PRESENTATION
     web app / website / tool ............... DEVELOPMENT
@@ -1029,6 +1111,12 @@ named, and each receives the previous step's answer as its context:
   Pair BRAINS with the make-step when the thing needs thinking about first.
 - WORDS FIRST. A reel, video or deck needs a script, captions or slide copy,
   and writing those is CONTENT's job, not BRAINS'.
+- A VIDEO IS NEVER ONE PICTURE. A reel, short, animation, motion graphic or
+  video ad is CONTENT (script and scene list) followed by MEDIA, which makes
+  the pictures its scenes need and films the finished file. Never plan VISUAL
+  alone for it, and leave VISUAL off unless the person also asked for a
+  separate picture (a poster, a thumbnail). A request for only a picture,
+  logo or poster is VISUAL alone, with no video step.
 - RESEARCH is for facts from the live web the model would not already know —
   real prices, named companies, recent events, citations. Not for material
   the person has already given you, and not for a simple request.
@@ -1233,6 +1321,47 @@ def planned_steps(routing: dict, agents: dict) -> list[tuple[str, str]]:
     return out
 
 
+# What a step costs in calls, for the "about N credits" line on the plan. A
+# local renderer is many calls, not one: script, picture briefs, then the
+# art director and one turn per scene. Rough on purpose; the server's own
+# /estimate prices each call, this only says how many.
+_RENDERER_CALLS = {"code": 8, "writer": 2}
+_RENDERER_IMAGES = 5
+
+
+def estimate_run(routing: dict, agents: dict) -> dict:
+    """{"typical_mc", "max_mc", "calls"} for the plan as it stands, from the
+    server's estimate route (never charges). {} when AI is not on the server
+    or the server cannot say; the plan is shown without a number then."""
+    from . import ai_client, server_session as SS
+    if not ai_client.active():
+        return {}
+    wanted: dict[tuple, int] = {}                 # (role, images) -> calls
+    for stage, name in planned_steps(routing, agents):
+        cfg = A.resolve_agent(stage, name) or {}
+        if cfg.get("local") and stage == "media":
+            for role, n in _RENDERER_CALLS.items():
+                wanted[(role, 0)] = wanted.get((role, 0), 0) + n
+            wanted[("image", 1)] = wanted.get(("image", 1), 0) + _RENDERER_IMAGES
+        elif stage == "visual" or cfg.get("local") == "flux_image":
+            wanted[("writer", 0)] = wanted.get(("writer", 0), 0) + 1
+            wanted[("image", 1)] = wanted.get(("image", 1), 0) + 1
+        else:
+            key = (SS.role_for(stage, name), 0)
+            wanted[key] = wanted.get(key, 0) + 1
+    typical = top = calls = 0
+    try:
+        for (role, images), n in wanted.items():
+            got = ai_client.estimate(role, approx_in_chars=6000, images=images,
+                                     addon="core", feature="plan_estimate")
+            typical += int(got.get("typical_mc") or 0) * n
+            top += int(got.get("max_mc") or 0) * n
+            calls += n
+    except Exception:                                    # noqa: BLE001
+        return {}
+    return {"typical_mc": typical, "max_mc": top, "calls": calls}
+
+
 def plan_changed(planned: list, confirmed: list) -> bool:
     """Did the person change the plan before pressing Start?
 
@@ -1364,7 +1493,7 @@ Return ONLY this JSON (no markdown, no commentary):
 
 def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     """Call Groq and return the routing dict (stage -> {questions, needed})."""
-    agents = {k: v for k, v in (cfg.get("agents") or {}).items() if v}
+    agents = A.server_effective(cfg.get("agents"))
     if not agents:
         raise ValueError("No agents configured. Run /agents to pick some first.")
 
@@ -1425,6 +1554,10 @@ def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     if apply_research_reasoning_guardrail(routing, agents):
         ui.info(f"🛡️  guardrail enabled Think it through ({agents['brains']}) "
                 "after research")
+    vid = apply_video_guardrail(query, routing, agents)
+    if vid:
+        ui.info("🛡️  guardrail: a video is a pipeline (script, then scenes "
+                f"and render) — {', '.join(vid)}")
     if apply_script_guardrail(routing, agents):
         ui.info(f"🛡️  guardrail enabled content ({agents['content']}) — "
                 "the reel/deck's script is a content job, not a brains job")

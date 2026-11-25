@@ -81,7 +81,8 @@ def choose_agent(cfg: dict) -> str:
     send them to a tool they are not signed in to, and the run would die on a
     login wall.
     """
-    agents = {k: v for k, v in (cfg.get("agents") or {}).items() if v}
+    from . import agents as _A
+    agents = _A.server_effective(cfg.get("agents"))
     for stage in STAGE_ORDER:
         if agents.get(stage):
             return agents[stage]
@@ -98,6 +99,9 @@ def available(cfg: dict) -> tuple[bool, str]:
     failure otherwise arrives several minutes into a run that has already
     opened a browser window.
     """
+    from . import ai_client
+    if ai_client.active():
+        return True, ""           # Prism's server writes it; no browser needed
     try:
         from . import automation  # noqa: F401
     except Exception as e:
@@ -125,6 +129,18 @@ def draft(cfg: dict, prompt: str, *, purpose: str = "draft",
     the reply in the first place.
     """
     attachments = list(attachments or [])
+    from . import ai_client
+    if ai_client.active():
+        # Server mode: one call to the `writer` role, no browser, no tab.
+        from . import server_session as _SS
+        try:
+            text = ai_client.chat(
+                "writer", prompt, addon="email", feature=purpose,
+                attachments=_SS._attachment_blocks(attachments) or None)
+        except ai_client.AiError as e:
+            return Draft(agent="Prism", error=ai_client.plain(e))
+        return Draft(text=clean_reply(text), agent="Prism",
+                     attachments=attachments)
     try:
         from . import automation
     except Exception as e:

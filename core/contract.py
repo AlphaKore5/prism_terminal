@@ -129,7 +129,12 @@ def _requested_formats(query: str) -> list[str]:
     for pattern in _FILE_REQUEST:
         for m in pattern.finditer(text):
             before = text[:m.start("fmt")].split()
-            if before and before[-1].lower().strip(".,:;") in _INPUT_BEFORE:
+            after = text[m.end("fmt"):].split()
+            # "give me in THIS pdf FORM" asks for the pdf; "summarise this pdf" gives one.
+            says_output = bool(after) and after[0].lower().strip(".,:;") in (
+                "form", "format", "version")
+            if (before and before[-1].lower().strip(".,:;") in _INPUT_BEFORE
+                    and not says_output):
                 continue            # "the attached PDF" is what they gave you
             key = m.group("fmt").split()[0].lower().lstrip(".")
             found.append((m.start("fmt"), key))
@@ -334,11 +339,22 @@ def wanted_ext(query: str) -> str:
 #: What Prism can write itself from a step's text, if the tool will not.
 #: A spreadsheet or a deck built by guessing at the structure of prose would
 #: be a worse deliverable than an honest "not produced".
-_WRITABLE = ("", ".docx", ".pdf", ".md", ".csv", ".txt")
+_WRITABLE = ("", ".docx", ".pdf", ".xlsx", ".md", ".csv", ".txt")
 
 
 def can_write(ext: str) -> bool:
     return (ext or "") in _WRITABLE
+
+
+def wants_structured(ext: str, text: str = "") -> bool:
+    """Is this a file Prism asks the model to describe as JSON (core/filespec)
+    rather than write as Markdown? Spreadsheets and CSV always; a Word or PDF
+    document when the text it would be made from holds a table. Plain prose
+    stays on the Markdown path."""
+    from . import filespec                                  # noqa: PLC0415
+    if ext in (".xlsx", ".csv"):
+        return True
+    return ext in (".docx", ".pdf") and filespec.has_markdown_table(text)
 
 
 # ── the last resort: write the document ourselves ────────────────────────
@@ -365,10 +381,38 @@ def document_from_text(text: str, out_dir: str, stem: str,
     text = (text or "").strip()
     if not text or not can_write(ext):
         return "", ""
+    if ext == ".csv":
+        # CSV is data: only a real table in the text, made through the spec so
+        # it gets the BOM and the formula guard (core/filespec.py).
+        from . import filespec                              # noqa: PLC0415
+        data = filespec.spec_from_markdown_table(text, stem, "csv")
+        if not data:
+            return "", ""
+        try:
+            made = filespec.render(data, out_dir)
+        except filespec.FileSpecError:
+            return "", ""
+        return made[0]["path"], "Prism made this CSV from the table in the AI's answer"
+    # A spreadsheet is only made when the answer holds a real table; building
+    # one from prose would be a worse deliverable than an honest "not produced".
+    if ext == ".xlsx" and not re.search(r"^\s*\|.+\|\s*$", text, re.M):
+        return "", ""
     os.makedirs(out_dir, exist_ok=True)
-    # A PDF is the one common ask Prism cannot honour on its own — no PDF
-    # renderer is bundled — so the Word file is written instead and the
-    # difference is said out loud rather than left for the customer to find.
+    # A real PDF is drawn by Qt's own text engine (no extra library, works in
+    # the frozen app). Only when that is unavailable (the terminal CLI without
+    # PySide6) is the Word file written instead, and the difference said.
+    if ext == ".pdf":
+        try:
+            path = _write_pdf(text, os.path.join(out_dir, stem + ".pdf"))
+            return path, "Prism made this PDF from the AI's answer"
+        except Exception:                                    # noqa: BLE001
+            pass
+    if ext == ".xlsx":
+        try:
+            path = _write_xlsx(text, os.path.join(out_dir, stem + ".xlsx"))
+            return path, "Prism made this Excel file from the AI's answer"
+        except Exception:                                    # noqa: BLE001
+            ext = ".docx"
     if ext in ("", ".docx", ".pdf"):
         try:
             path = _write_docx(text, os.path.join(out_dir, stem + ".docx"))
@@ -386,6 +430,64 @@ def document_from_text(text: str, out_dir: str, stem: str,
         return path, "Prism saved the step's own text as a file"
     except OSError:
         return "", ""
+
+
+def _write_pdf(text: str, path: str) -> str:
+    """Markdown into a real PDF with Qt's text engine (headings, lists, bold,
+    tables, code). Needs PySide6; raises if it is not there."""
+    from PySide6.QtCore import QMarginsF                       # noqa: PLC0415
+    from PySide6.QtGui import (QGuiApplication, QPageLayout,   # noqa: PLC0415
+                               QPageSize, QPdfWriter, QTextDocument)
+    if QGuiApplication.instance() is None:
+        import os as _os                                       # noqa: PLC0415
+        _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        global _QAPP
+        _QAPP = QGuiApplication(["prism"])
+    doc = QTextDocument()
+    doc.setDefaultStyleSheet(
+        "body{font-family:'Helvetica','Arial',sans-serif;font-size:11pt}"
+        "h1{font-size:20pt}h2{font-size:16pt}h3{font-size:13pt}"
+        "pre,code{font-family:'Courier New',monospace;background:#eee}"
+        "td,th{padding:4px;border:1px solid #999}")
+    doc.setMarkdown(text)
+    writer = QPdfWriter(path)
+    writer.setPageSize(QPageSize(QPageSize.A4))
+    writer.setPageMargins(QMarginsF(18, 18, 18, 18), QPageLayout.Millimeter)
+    doc.print_(writer)
+    return path
+
+
+_QAPP = None
+
+
+def _write_xlsx(text: str, path: str) -> str:
+    """The Markdown tables in `text` become sheets; prose with no table goes in
+    one column. Raises if openpyxl is missing."""
+    from openpyxl import Workbook                              # noqa: PLC0415
+    wb = Workbook()
+    ws = wb.active
+    n = 0
+    rows = []
+    for line in text.splitlines():
+        if line.strip().startswith("|"):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if all(set(c) <= set("-: ") for c in cells):
+                continue
+            rows.append(cells)
+        elif rows:
+            n += 1
+            for r in rows:
+                ws.append(r)
+            ws = wb.create_sheet(f"Table {n + 1}")
+            rows = []
+    for r in rows:
+        ws.append(r)
+    if ws.max_row == 1 and ws.max_column == 1 and ws["A1"].value is None:
+        for line in text.splitlines():
+            if line.strip():
+                ws.append([line.strip()])
+    wb.save(path)
+    return path
 
 
 def _write_docx(text: str, path: str) -> str:

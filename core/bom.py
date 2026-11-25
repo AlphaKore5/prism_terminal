@@ -100,7 +100,8 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
                       has_template: bool = False, legend: str = "",
                       scoped: bool = False, brief_text: str = "",
                       allow_derived: bool = True, has_cad: bool = True,
-                      standards_text: str = "") -> str:
+                      standards_text: str = "", industry_note: str = "",
+                      derivation_example: str = "") -> str:
     """Turn the measured geometry into a Bill of Materials. Same signature as
     boq.formatting_prompt so the dialog can dispatch on mode with no other
     change; the CONTENT reframes the numbers as parts, not trades."""

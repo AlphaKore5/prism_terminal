@@ -285,6 +285,17 @@ def normalize_aliases(node: dict) -> None:
             if isinstance(node.get(alt), (str, int, float)):
                 node["content"] = str(node.pop(alt))
                 break
+    if node_type == "text" and isinstance(node.get("runs"), list):
+        # Coloured parts of one line. Keep only well-formed runs, and let the
+        # joined words stand as `content` so every check that reads content
+        # (caption match, bounds, Studio) sees what is on screen.
+        runs = [r for r in node["runs"] if isinstance(r, dict) and str(r.get("text", "")) != ""]
+        if runs:
+            node["runs"] = runs
+            if not isinstance(node.get("content"), str) or not node.get("content"):
+                node["content"] = "".join(str(r["text"]) for r in runs)
+        else:
+            node.pop("runs", None)
     if node_type == "text" and isinstance(node.get("content"), str):
         # Markdown escapes travel from the copy stage into the scene
         # ("www\\.alphakore\\.com" reached the screen with its backslashes).
@@ -478,7 +489,7 @@ def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
             if "zoom" in track:
                 try:
                     z = float(track["zoom"])
-                    track["zoom"] = max(0.1, min(8.0, z))  # clamp silently
+                    track["zoom"] = max(0.1, min(12.0, z))  # clamp silently
                 except (ValueError, TypeError):
                     track["zoom"] = 1.0  # safe default
             if "easing" in track:

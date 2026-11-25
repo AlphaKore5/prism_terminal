@@ -300,7 +300,8 @@ def extract(text: str, api_key: str, model: str = "", *,
                       "a purchase order. Setup → Groq API key.")
     from .router import groq_chat
     reply = groq_chat(api_key, model or "", _PROMPT + text[:12000],
-                      temperature=0.0, timeout=60)
+                      temperature=0.0, timeout=60,
+                      role="classify", addon="inquiry", feature="po_read")
     return from_json(_json_from(reply), source=source)
 
 

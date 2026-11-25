@@ -99,6 +99,39 @@ def _resolve_asset_srcs(node: Dict[str, Any], uris: Dict[str, str]) -> None:
                 _resolve_asset_srcs(child, uris)
 
 
+def _absolute_scale_tweens(node: Dict[str, Any]) -> None:
+    """Read a scale tween written as ABSOLUTE values as absolute.
+
+    The runtime adds a scale tween's from/to to the node's own scale (the
+    catalogue says so: "from -0.3" means 0.3 smaller than where it settles).
+    A model asked for "a pop down to 1x" writes scale 1.08 -> 1.0, and the
+    runtime drew the node at 2.08x -> 2.0x: a model-written headline was
+    twice its size and cut off at both edges (found 12 Nov 2026, by reading the
+    node's host transform, matrix(2, 0, 0, 2, ...)). Offsets people mean are
+    small or negative; a scale tween whose two ends are both >= 0.4 is
+    absolute and is converted to offsets from the node's scale. Idempotent: the
+    converted values are below 0.4.
+    """
+    anim = node.get("animation")
+    if isinstance(anim, dict):
+        scale = node.get("scale") or [1.0, 1.0]
+        for block in ("enter", "exit"):
+            tweens = (anim.get(block) or {}).get("tweens") if isinstance(anim.get(block), dict) else None
+            for tw in tweens or []:
+                if not isinstance(tw, dict) or tw.get("channel") not in ("scale", "scaleX", "scaleY"):
+                    continue
+                try:
+                    frm, to = float(tw["from"]), float(tw["to"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if frm >= 0.4 and to >= 0.4:
+                    base = float(scale[1] if tw["channel"] == "scaleY" and len(scale) > 1 else scale[0])
+                    tw["from"], tw["to"] = round(frm - base, 4), round(to - base, 4)
+    for child in node.get("children", []) or []:
+        if isinstance(child, dict):
+            _absolute_scale_tweens(child)
+
+
 def _offset_node_times(node: Dict[str, Any], offset: float) -> None:
     """Shift a node's (and its children's) authored animation times by
     `offset`, in place. Scenes are written scene-local (a node's `enter`/
@@ -106,6 +139,7 @@ def _offset_node_times(node: Dict[str, Any], offset: float) -> None:
     matching how core.reel_web's per-scene prompts work) — this is what
     turns that into the single global timeline runtime.js actually plays.
     """
+    _absolute_scale_tweens(node)
     anim = node.get("animation")
     if isinstance(anim, dict):
         for block_name in ("enter", "exit"):
@@ -140,6 +174,36 @@ def _offset_node_times(node: Dict[str, Any], offset: float) -> None:
                     node[key] = float(node.get(key, 0.0) or 0.0) + offset
                 except (TypeError, ValueError):
                     node[key] = offset
+    # A cursor's moves and a prompt box's send moment are scene-local too.
+    if node_type == "cursor" and isinstance(node.get("path"), list):
+        for seg in node["path"]:
+            if isinstance(seg, dict):
+                try:
+                    seg["at"] = float(seg.get("at", 0.0) or 0.0) + offset
+                except (TypeError, ValueError):
+                    seg["at"] = offset
+    if node_type == "ui_checklist" and isinstance(node.get("items"), list):
+        for it in node["items"]:
+            if isinstance(it, dict):
+                try:
+                    it["at"] = float(it.get("at", 0.0) or 0.0) + offset
+                except (TypeError, ValueError):
+                    it["at"] = offset
+    if node_type == "ui_window":
+        try:
+            node["play_at"] = float(node.get("play_at", 0.0) or 0.0) + offset
+        except (TypeError, ValueError):
+            node["play_at"] = offset
+    if node_type == "ui_swatches":
+        try:
+            node["at"] = float(node.get("at", 0.0) or 0.0) + offset
+        except (TypeError, ValueError):
+            node["at"] = offset
+    if node_type == "ui_input" and node.get("send_at") is not None:
+        try:
+            node["send_at"] = float(node["send_at"]) + offset
+        except (TypeError, ValueError):
+            node.pop("send_at", None)
     phases = node.get("phases")
     if node_type == "particle_field" and isinstance(phases, list):
         for phase in phases:
@@ -160,6 +224,7 @@ def _offset_node_times(node: Dict[str, Any], offset: float) -> None:
 # an absent reveal_start means "at this scene's start", not "at t=0".
 _CONTENT_TIME_TYPES = {
     "text": ("reveal_start",),
+    "ui_input": ("reveal_start",),
     "domain_chart": ("reveal_start",), "chart": ("reveal_start",),
     "domain_diagram": ("reveal_start",), "diagram": ("reveal_start",), "workflow": ("reveal_start",),
     "shape_arrow": ("draw_start",), "arrow": ("draw_start",),
@@ -197,6 +262,34 @@ def _continuity_manifest(scenes: List[Dict[str, Any]]) -> Dict[str, List[Dict[st
     return groups
 
 
+_BACKDROP_KEYS = ("spotlight", "vignette_strength", "grain_opacity", "grid", "particles")
+
+
+def _auto_look(spec: Dict[str, Any]) -> None:
+    """A light background gets the flat "paper" look unless the author chose
+    one or set any backdrop value themselves.
+
+    The runtime's only look used to be a dark-tech one — a cyan spotlight
+    fading to navy, a scrolling grid, cyan particles, a 0.58 vignette — and it
+    was painted over every film whatever its background, so a light page came
+    out a blue-grey wash (study of 11-12 Nov 2026). Nobody asks for a navy
+    spotlight on white; a light background is the signal.
+    """
+    project = spec.get("project")
+    if not isinstance(project, dict):
+        return
+    visual = spec.get("visual") if isinstance(spec.get("visual"), dict) else {}
+    if project.get("look") or visual.get("look") or any(k in visual for k in _BACKDROP_KEYS):
+        return
+    bg = project.get("background")
+    if not isinstance(bg, str):
+        return
+    from .inspect import _luma
+    lum = _luma(bg)
+    if lum is not None and lum >= 180:
+        spec["project"] = dict(project, look="paper")
+
+
 def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
     """Preprocesses and enriches a validated Motion Specification.
     - Resolves semantic targets in camera tracks
@@ -223,9 +316,18 @@ def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
       the result on `_continuity_compiled` (threads, bridges, errors,
       warnings).
     """
-    spec = dict(spec)
+    # A copy, not the caller's dict. This function shifts every scene-local
+    # time by its scene's start, IN PLACE, and a second pass over the same nodes
+    # shifts them again: a caller that measured a film (rhythm.probe,
+    # critic.settled_frames) and then rendered the same spec drew every scene
+    # after the first late, and the result was blank frames (12 Nov 2026). The
+    # `_scene_times_resolved` flag below protects a RESOLVED spec; this protects
+    # the one the caller is still holding.
+    import copy as _copy
+    spec = _copy.deepcopy(spec)
     scenes = spec.get("scenes", [])
     camera = spec.get("camera", {})
+    _auto_look(spec)
 
     assets_table = spec.get("_assets")
     if assets_table:
@@ -367,7 +469,8 @@ def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
         height = int((spec.get("project") or {}).get("height", 1920) or 1920)
         compiled = _camera.compile_tracks(
             scenes, width, height, world,
-            authored if isinstance(authored, list) else None)
+            authored if isinstance(authored, list) else None,
+            content_boxes=spec.get("_content_boxes"))
         if compiled is not None:
             if not isinstance(camera, dict):
                 camera = {}

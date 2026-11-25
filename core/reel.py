@@ -1156,10 +1156,13 @@ def render(spec: dict, out_path: str, on_progress=None) -> str:
     return out_path
 
 
-def spec_instructions() -> str:
+def spec_instructions(requested: float | None = None) -> str:
     """What an AI stage must produce. The agent decides the WORDS and the
     running order; this module decides the pixels — so the layout can never
     be broken by a model having an off day.
+
+    `requested`: the length the client asked for, in seconds (see
+    core.length) — the pacing line then names it instead of the house band.
 
     Appended, not sent alone: the router plans this stage's task before it
     knows a local renderer is downstream, so the brief it writes routinely
@@ -1264,7 +1267,11 @@ def spec_instructions() -> str:
         "PACING — a viewer reads three words in under two seconds:\n"
         "  statement 3–6s · figure 4–6.5s · trend 5–8s · list 4–7s\n"
         "  pillar 3–6s · hub 4–7s · brand 4–6s · endcard 3–5s\n"
-        "  4 to 7 scenes, 20–35 seconds in total. A reel is not a film.\n\n"
+        + (f"  4 to 7 scenes, about {requested:g} seconds in total — the client "
+           f"asked for {requested:g}; land within 15% of it. A reel is not a "
+           "film.\n\n" if requested
+           else "  4 to 7 scenes, 20–35 seconds in total. A reel is not a film.\n\n")
+        +
         "COPY LIMITS — these are what keeps type large enough to read:\n"
         "  heading under 34 characters · caption under 90 · statement at most "
         "3 lines · list at most 4 items · pillar exactly 3 icons · hub exactly "
@@ -1308,6 +1315,49 @@ def spec_instructions() -> str:
 
 # ── brand extraction & spec parsing ─────────────────────────────────────────
 
+def _is_green(rgb) -> bool:
+    r, g, b = rgb
+    return g > r + 18 and g > b + 18
+
+
+def _leading_colour(image_paths: list[str]):
+    """The artwork's leading saturated colour, any hue, as (r, g, b) — or None
+    when it is all greys, whites and blacks. Colours are grouped into twelve
+    hue families first, so a logo's one red beats a photograph's scatter of
+    many different ones; the family is ranked like the green reading, by how
+    much there is of it and how vivid it is."""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    import colorsys
+    from collections import Counter
+    family: dict[int, float] = {}
+    members: dict[int, Counter] = {}
+    exact: dict[tuple, Counter] = {}
+    for p in image_paths:
+        try:
+            im = Image.open(p).convert("RGB")
+        except Exception:
+            continue
+        im.thumbnail((320, 320))
+        for px in im.getdata():
+            r, g, b = px
+            sat = max(px) - min(px)
+            if sat <= 70 or max(px) < 70:
+                continue                          # grey, white, black or mud
+            h = int(colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)[0] * 12) % 12
+            family[h] = family.get(h, 0.0) + sat ** 1.6
+            near = (r & 0xF8, g & 0xF8, b & 0xF8)   # anti-aliased edges vote with their neighbours
+            members.setdefault(h, Counter())[near] += 1
+            exact.setdefault(near, Counter())[px] += 1
+    if not family:
+        return None
+    best = max(family, key=family.get)
+    near, _ = max(members[best].items(), key=lambda kv: kv[1] * (max(kv[0]) - min(kv[0])) ** 1.6)
+    return exact[near].most_common(1)[0][0]
+
+
 def sample_brand(image_paths: list[str]) -> dict:
     """Read the client's palette off their own artwork — a business card, a
     logo, a brochure — instead of asking anyone to type hex codes.
@@ -1345,6 +1395,15 @@ def sample_brand(image_paths: list[str]) -> dict:
                 deep_votes[px] += 1
 
     out = {}
+    # The green reading above was written for the first client, whose brand is
+    # green; a red, blue or orange brand came back with no colours at all. So
+    # every hue is read too, and green keeps its own tuned reading only when
+    # green really is the artwork's leading colour.
+    lead = _leading_colour(image_paths)
+    if lead and not (accent_votes and _is_green(lead)):
+        r, g, b = lead
+        return {"accent": "#%02X%02X%02X" % lead,
+                "deep": "#%02X%02X%02X" % (int(r * .72), int(g * .72), int(b * .72))}
     if accent_votes:
         # Rank by frequency AND vividness, not frequency alone. A logo mark
         # covers more pixels than a heading, but the heading usually carries
@@ -1424,8 +1483,11 @@ def _scene_text(sc: dict):
                 yield k, item["label"]
 
 
-def lint_spec(spec: dict) -> list[str]:
+def lint_spec(spec: dict, requested: float | None = None) -> list[str]:
     """What is wrong with this spec, in words the writer can act on.
+
+    `requested`: the length the client asked for, in seconds; the total is
+    then held to ±15 % of it instead of the house REEL_SECONDS band.
 
     Not a schema check — parse_spec already guarantees the shape. This catches
     the mistakes that render as something embarrassing: a data series typed
@@ -1443,7 +1505,18 @@ def lint_spec(spec: dict) -> list[str]:
 
     total = sum(float(sc.get("_seconds_asked", sc.get("seconds", 4)) or 4)
                 for sc in scenes)
-    if total < REEL_SECONDS[0]:
+    if requested:
+        from .length import bounds
+        lo, hi = bounds(requested)
+        if total < lo:
+            out.append(f"The reel is only {total:.0f}s long — the client asked "
+                       f"for {requested:g}s; lengthen the scenes that carry the "
+                       "most, or add one, to land within 15% of that.")
+        elif total > hi:
+            out.append(f"The reel runs {total:.0f}s — the client asked for "
+                       f"{requested:g}s; cut to within 15% of that by dropping "
+                       "a scene, not by shortening every one.")
+    elif total < REEL_SECONDS[0]:
         out.append(f"The reel is only {total:.0f}s long — aim for 20 to 35s.")
     elif total > REEL_SECONDS[1]:
         out.append(f"The reel runs {total:.0f}s — too long for a feed. "
@@ -1505,8 +1578,14 @@ def lint_spec(spec: dict) -> list[str]:
                                "as text. Delete it; the renderer handles motion.")
                     break
             # Two or more big numbers in one string is a series, and a series
-            # belongs in a chart.
-            if key != "value" and len(re.findall(r"\d[\d,]{2,}", val)) >= 2:
+            # belongs in a chart. A phone number is not a series: "+91 98765
+            # 43210" is two five-digit groups, and this sent every endcard
+            # with an Indian number back to be charted (study of 11 Nov
+            # 2026, finding R1). The endcard's own 'contact' line and any
+            # phone-shaped string are left alone.
+            phone_like = re.search(r"\+?\d[\d\s\-()]{7,}\d", val) is not None
+            if (key not in ("value", "contact") and not phone_like
+                    and len(re.findall(r"\d[\d,]{2,}", val)) >= 2):
                 out.append(f"{where}: '{key}' has a series of numbers in it. "
                            "Move them into a 'trend' scene as real numeric "
                            "points — the renderer charts those.")

@@ -136,6 +136,9 @@ def available() -> tuple[bool, str]:
 # ── the harness ─────────────────────────────────────────────────────────────
 # Everything the page can rely on, and everything it is not allowed to break.
 
+EMPTY_BAND = 0.33           # a scene may leave at most this share of the frame bare at the top or the bottom
+CAMERA_PUSH = 0.08          # how far the camera travels in one scene (8% of the frame)
+
 _HARNESS_CSS = f"""
 *, *::before, *::after {{ box-sizing: border-box; }}
 html, body {{
@@ -152,6 +155,17 @@ html, body {{
 #stage > .scene {{ position: absolute; inset: 0; visibility: hidden; }}
 #stage > .scene.on {{ visibility: visible; }}
 #stage > .scene.on .scene, #stage > .scene.on * {{ visibility: visible; }}
+/* THE CAMERA. Every scene is pushed in (or pulled back) slowly for its whole
+   length, by the harness, whatever the design wrote. A film whose designer put
+   every entrance in the first second and then held still for four was measured
+   at 82% still frames (13 Nov 2026, "poster" look, target 15-45%): the model's
+   own "slow drift" was 18px over six seconds, below what the eye or the
+   measurement sees. `scale` is the individual property, so it composes with
+   the cut library's `transform` instead of fighting it. --q runs 0->1 (push in)
+   or 1->0 (pull back) and is set by the seeker; the layout check switches the
+   camera off (`nocam`) because it asks where things are at rest. */
+#stage > .scene.on {{ scale: calc(1 + var(--q, 0) * {CAMERA_PUSH}); }}
+#stage.nocam > .scene {{ scale: none !important; }}
 /* The safe area is advisory for the designer and enforced by the checker. */
 :root {{ --safe-x: {SAFE_X}px; --safe-y: {SAFE_Y}px; --W: {W}px; --H: {H}px; }}
 .safe {{ position: absolute; inset: var(--safe-y) var(--safe-x); }}
@@ -228,6 +242,7 @@ window.__seek = function (t) {
     const local = t - s.start;
     el.style.setProperty('--p', (local / s.dur).toFixed(5));
     el.style.setProperty('--ms', Math.round(local));
+    el.style.setProperty('--q', (i %%%% 2 ? 1 - local / s.dur : local / s.dur).toFixed(5));
 
     // Overlap windows: the outgoing scene is 'leaving' with --x running 0->1,
     // the incoming one is 'entering' with --e running 0->1.
@@ -271,6 +286,26 @@ window.__seek = function (t) {
     }
   }
   return true;
+};
+
+// Top and bottom of what a viewer reads as the scene's content: leaf text,
+// pictures, and shapes with a fill or border of their own. A ground that covers
+// most of the frame is the background, not content.
+window.__extent = function (scene) {
+  let top = Infinity, bottom = -Infinity;
+  for (const el of scene.querySelectorAll('*')) {
+    const cs = getComputedStyle(el);
+    if (cs.visibility === 'hidden' || cs.display === 'none' || parseFloat(cs.opacity) < 0.05) continue;
+    const tag = el.tagName.toLowerCase();
+    const isText = !el.children.length && (el.textContent || '').trim();
+    const isPic = tag === 'img' || tag === 'svg' || tag === 'picture' || tag === 'video';
+    const filled = cs.backgroundColor !== 'rgba(0, 0, 0, 0)' || cs.borderTopStyle !== 'none';
+    if (!isText && !isPic && !filled) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4 || r.width * r.height > 0.8 * __W__ * __H__) continue;
+    top = Math.min(top, r.top); bottom = Math.max(bottom, r.bottom);
+  }
+  return top === Infinity ? null : { top: Math.max(0, top), bottom: Math.min(__H__, bottom) };
 };
 
 // Legibility check, run on the page rather than guessed at from Python: the
@@ -451,6 +486,28 @@ window.__check = function () {
         }
       }
     }
+    // Where the content sits. Both live films of 13 Nov 2026 packed every scene
+    // into the middle or top of the frame and left a third of it bare (soft:
+    // cards ending 64 percent down; poster: a whole red field with nothing in its upper
+    // half), the "empty lower half" the owner had already complained of. Only
+    // the browser knows where the content landed, so it is measured here:
+    // text, pictures and filled shapes, not full-bleed grounds.
+    const ext = window.__extent(scene);
+    if (ext) {
+      const gapTop = ext.top / __H__, gapBottom = (__H__ - ext.bottom) / __H__;
+      const limit = __GAP__;
+      const key = 'gap|' + (scene.id || 'scene');
+      if ((gapTop > limit || gapBottom > limit) && !seen.has(key)) {
+        seen.add(key);
+        const bare = [];
+        if (gapTop > limit) bare.push('top ' + Math.round(gapTop * 100) + ' percent');
+        if (gapBottom > limit) bare.push('bottom ' + Math.round(gapBottom * 100) + ' percent');
+        out.push('scene ' + (scene.id || '') + ' leaves the ' + bare.join(' and the ') +
+                 ' of the frame empty — its content fills only the band between ' +
+                 Math.round(gapTop * 100) + ' and ' + Math.round((1 - gapBottom) * 100) +
+                 ' percent of the height. Spread it over the height: set the main element larger, or move the group toward the middle');
+      }
+    }
     if (visibleContent === 0) {
       const key = 'empty|' + (scene.id || 'scene');
       if (!seen.has(key)) {
@@ -466,7 +523,16 @@ window.__check = function () {
   }
   return out;
 };
+window.__check = (function (f) {
+  return function () {
+    const st = document.getElementById('stage');
+    st.classList.add('nocam');
+    try { return f(); } finally { st.classList.remove('nocam'); }
+  };
+})(window.__check);
 """ % ("%s", W, H, T_LABEL, T_LABEL, W, H, W, H)
+_HARNESS_JS = (_HARNESS_JS.replace("__W__", str(W)).replace("__H__", str(H))
+               .replace("__GAP__", str(EMPTY_BAND)))
 
 
 def _plan(spec: dict, fps: int):
@@ -945,6 +1011,40 @@ def scope_css(css: str, idx: int) -> str:
     return out
 
 
+def font_urls(families) -> list[str]:
+    """Google Fonts stylesheet URLs for the design's `google_fonts` list.
+
+    The design is asked for "family with only the required weights" and writes
+    that as "Anton:400" or "Inter:400,700" — the old v1 spelling. Pasted into a
+    css2 URL as written, Google answers HTTP 400, no face is registered and the
+    whole film is set in the fallback sans (found 13 Nov 2026 on the first live
+    "poster" film: Anton chosen, Arial filmed). So the weights are rewritten to
+    css2's `:wght@400;700`, and the bare family is always asked for as well: a
+    weight the family does not have fails the weighted request, and the film
+    must still get the family.
+    """
+    urls = []
+    for family in (families or [])[:3]:
+        name, _, tail = str(family).strip().partition(":")
+        if not tail:                          # "Inter 400 700"
+            got = re.match(r"^(.*?\D)[\s,]+(\d{3}(?:[\s,;]+\d{3})*)$", name)
+            if got:
+                name, tail = got.group(1), got.group(2)
+        name = re.sub(r"\s+", "+", name.strip().strip("'\""))
+        if not name:
+            continue
+        base = f"https://fonts.googleapis.com/css2?family={name}"
+        urls.append(base + "&display=block")
+        tail = tail.strip().replace(" ", "")
+        if "@" in tail:                       # already css2: wght@400;700, ital,wght@0,400;1,400
+            urls.append(f"{base}:{tail}&display=block")
+        else:
+            weights = sorted({int(w) for w in re.findall(r"\d{3}", tail)})
+            if weights and weights != [400]:
+                urls.append(f"{base}:wght@{';'.join(map(str, weights))}&display=block")
+    return urls
+
+
 def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
     """The whole reel as one self-contained page.
 
@@ -964,12 +1064,8 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
                    if name not in _blocked_assets(design)}
     plan, _ = _plan(spec, fps)
 
-    fonts = ""
-    for family in (design.get("google_fonts") or [])[:3]:
-        fam = str(family).strip().replace(" ", "+")
-        if fam:
-            fonts += (f'<link rel="stylesheet" href="https://fonts.googleapis.com'
-                      f'/css2?family={fam}&display=block">')
+    fonts = "".join(f'<link rel="stylesheet" href="{u}">'
+                    for u in font_urls(design.get("google_fonts")))
 
     brand = spec.get("brand") or {}
     root_vars = ";".join(f"--{k}:{v}" for k, v in brand.items()
@@ -1099,6 +1195,7 @@ def render(spec: dict, out_path: str, on_progress=None,
                                 device_scale_factor=1)
         try:
             page.set_content(html, wait_until="load")
+            _browser.warm_fonts(page)
             try:
                 page.wait_for_function("document.fonts.ready.then(()=>true)",
                                        timeout=8000)
@@ -1161,6 +1258,126 @@ def render(spec: dict, out_path: str, on_progress=None,
     return out_path
 
 
+def rhythm_probe(spec: dict, sample_fps: int = 10, width: int = 192) -> dict | None:
+    """The reel's rhythm (core.motion.rhythm): the page played at low resolution,
+    `sample_fps` frames a second, and measured. None when there is no browser.
+    The same numbers motion.rhythm.probe gives a Motion film and
+    rhythm.probe_video gives any finished file."""
+    ok, _why = available()
+    if not ok:
+        return None
+    import numpy as np
+    from io import BytesIO
+    from PIL import Image
+    from playwright.sync_api import sync_playwright
+    from . import browser as _browser
+    from .motion import rhythm as _rhythm
+    fps = int(spec.get("fps", DEFAULT_FPS))
+    _plan_rows, total = _plan(spec, fps)
+    html = build_html(spec, fps)
+    frames = []
+    with sync_playwright() as p:
+        browser = _browser.launch_chromium(p, args=["--hide-scrollbars", "--font-render-hinting=none"])
+        page = browser.new_page(viewport={"width": W, "height": H}, device_scale_factor=min(1.0, width / W))
+        try:
+            page.set_content(html, wait_until="load")
+            _browser.warm_fonts(page)
+            try:
+                page.wait_for_function("document.fonts.ready.then(()=>true)", timeout=8000)
+            except Exception:
+                pass
+            for n in range(int(total / fps * sample_fps)):
+                _seek_page(page, n * 1000.0 / sample_fps)
+                frames.append(np.asarray(Image.open(BytesIO(page.screenshot(type="png"))).convert("L"), dtype=np.float32))
+        finally:
+            browser.close()
+    return _rhythm.profile_from_frames(frames, sample_fps)
+
+
+def settled_frames(spec: dict, at: float = 0.8, width: int = 540) -> list[tuple[int, bytes]]:
+    """One PNG per scene, `at` of the way through it, `width` wide, for the vision
+    critic (core.motion.critic). [] when there is no browser."""
+    ok, _why = available()
+    if not ok:
+        return []
+    from playwright.sync_api import sync_playwright
+    from . import browser as _browser
+    fps = int(spec.get("fps", DEFAULT_FPS))
+    plan, _total = _plan(spec, fps)
+    html = build_html(spec, fps)
+    out: list[tuple[int, bytes]] = []
+    with sync_playwright() as p:
+        browser = _browser.launch_chromium(p, args=["--hide-scrollbars", "--font-render-hinting=none"])
+        page = browser.new_page(viewport={"width": W, "height": H}, device_scale_factor=min(1.0, width / W))
+        try:
+            page.set_content(html, wait_until="load")
+            _browser.warm_fonts(page)
+            try:
+                page.wait_for_function("document.fonts.ready.then(()=>true)", timeout=8000)
+            except Exception:
+                pass
+            for i, s in enumerate(plan[:12]):
+                _seek_page(page, s["start"] + s["dur"] * at)
+                out.append((i, page.screenshot(type="png")))
+        finally:
+            browser.close()
+    return out
+
+
+def _repair_rhythm(scenes: list[dict], design: dict, ask, say, measure, check=None, assets_table=None) -> None:
+    """Film-level pass the per-scene layout check cannot make: the assembled reel
+    is played at low resolution and its rhythm measured. A reel that is mostly
+    still (or never rests) sends its worst scenes back once each with the
+    measured numbers; the fix is kept only if the whole reel lands clearly nearer
+    the 15-45 % still-frame band. In place; never raises."""
+    from .motion import rhythm as _rhythm
+
+    def spec_of(rows):
+        out = {"design": design, "scenes": rows}
+        if assets_table:
+            out["_assets"] = assets_table
+        return out
+
+    try:
+        profile = measure(spec_of(scenes))
+    except Exception as e:                              # noqa: BLE001
+        say(f"rhythm: could not be measured ({e})")
+        return
+    what = _rhythm.kind(profile)
+    if not what:
+        return
+    durations = [float(s.get("seconds") or 0.0) for s in scenes]
+    for idx in _rhythm.targets(profile, durations, what):
+        activity = _rhythm.scene_activity(profile, durations)[idx]
+        say(f"rhythm: {profile['static_pct']:.0f}% of frames are still — sending scene {idx + 1} back")
+        fixed = parse_scene(ask(
+            _rhythm.repair_text(idx + 1, what, profile, activity, medium="studio")
+            + f"\n\nSend the corrected scene {idx + 1}: ONLY the JSON object, same keys, in a ```json fenced block.",
+            SCENE_EXPECT) or "")
+        if not fixed:
+            say(f"   scene {idx + 1} never came back — keeping the first and stopping the rhythm pass")
+            break
+        fixed.setdefault("seconds", scenes[idx].get("seconds"))
+        fixed.setdefault("cut", scenes[idx].get("cut", ""))
+        fixed.setdefault("type", scenes[idx].get("type", ""))
+        trial = list(scenes)
+        trial[idx] = fixed
+        try:
+            after = measure(spec_of(trial))
+            worse_alone = bool(check) and len(check({"design": design, "scenes": [fixed], "_assets": assets_table or {}})) \
+                > len(check({"design": design, "scenes": [scenes[idx]], "_assets": assets_table or {}}))
+        except Exception:                               # noqa: BLE001
+            after, worse_alone = None, True
+        if _rhythm.better(profile, after) and not worse_alone:
+            scenes[idx] = fixed
+            say(f"   scene {idx + 1} fixed — {profile['static_pct']:.0f}% still became {after['static_pct']:.0f}%")
+            profile = after
+            if not _rhythm.kind(profile):
+                break
+        else:
+            say(f"   scene {idx + 1}'s correction was no better — keeping the first")
+
+
 def inspect(spec: dict, at: float = 0.75) -> list[str]:
     """Run the legibility check without encoding — used to reject a design
     and ask for a fix before a minute of rendering is spent on it."""
@@ -1188,6 +1405,7 @@ def inspect(spec: dict, at: float = 0.75) -> list[str]:
                                 device_scale_factor=1)
         try:
             page.set_content(html, wait_until="load")
+            _browser.warm_fonts(page)
             try:
                 page.wait_for_function("document.fonts.ready.then(()=>true)",
                                        timeout=8000)
@@ -1526,7 +1744,7 @@ def imagery_instructions(request: str, has_own_artwork: bool = False,
 
 
 def design_instructions(brand: dict | None = None, request: str = "",
-                        assets: str = "") -> str:
+                        assets: str = "", look: str = "", kit: dict | None = None) -> str:
     """The art-direction pass — the LOOK and the STORYBOARD, no scenes yet.
 
     This used to ask for the whole reel in one reply, and that single fact was
@@ -1545,6 +1763,20 @@ def design_instructions(brand: dict | None = None, request: str = "",
     # None means "not known yet" — the research stage supplies it at run time
     # and the token is substituted the moment before this prompt is typed.
     swatch = BRAND_TOKEN if brand is None else brand_block(brand)
+    # `look`: the art direction Prism chose for this film (core.looks). With one
+    # set, the worked examples below that every reel was copying — the arch and
+    # its CSS — are taken out, and the direction is stated after the colours.
+    # `kit`: the client's identity beyond colour (core.brandkit).
+    from . import brandkit as _brandkit, looks as _looks
+    kit = kit or {}
+    direction = _looks.text(look, fonts_given=bool(kit.get("display_font") or kit.get("body_font")))
+    framing_example = ("" if direction else
+                       "(for example: classic architectural arches, soft rounded editorial cards, "
+                       "or a measured rule/grid system) ")
+    card_shapes = ("in the shapes this film's art direction names" if direction else
+                   "clean rounded corners (`border-radius: 20px-36px`) or tall arches "
+                   "(`border-radius: 400px 400px 0 0`)")
+    swatch += direction + _brandkit.block(kit)       # the mark has its own rules in the artwork section below
     return (
         # Fences are now REQUIRED, having been forbidden here since this was
         # written. Diagnosed from a saved failure: asked for bare JSON, the
@@ -1583,23 +1815,25 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "(occupying 40-60% of the visual weight). If a scene has bullet points or features, place them in a clean editorial "
         "column with clear spacing, never overlapping or crowding the product. "
         "BALANCED VERTICAL COMPOSITION: Distribute the composition with intentional balance across the 1080x1920 canvas. "
-        "Avoid leaving half the screen empty or clustering elements in one corner. "
+        "Avoid clustering elements in one corner. Every scene's content must run from within the top third of the 1920px "
+        "frame to within the bottom third: no more than ~630px bare at the top or at the bottom (the layout check measures "
+        "this and sends the scene back) — size the main element up or place the group in the middle, do not float a small "
+        "card in a blank frame. "
         "Never print giant random numbers (like '200 g') that overpower the product. "
         "Labels and descriptions must accurately describe the featured artwork on screen. "
         "Do not default to split-screen, a narrow image strip, or a picture beside an oversized headline. Keep "
         "all copy live HTML/CSS: generated images are visual ingredients only, "
         "never a finished poster or text-bearing storyboard."
         "\nSHAPE & EDITORIAL FRAMING — geometric elements must feel authored, not like "
-        "placeholders. Define one cohesive framing system for the whole reel (for "
-        "example: classic architectural arches, soft rounded editorial cards, "
-        "or a measured rule/grid system) and reuse it with variation. Every "
+        "placeholders. Define one cohesive framing system for the whole reel "
+        f"{framing_example}and reuse it with variation. Every "
         "shape needs a job in the story or hierarchy. Use optical alignment, "
         "a small stroke scale (1px/2px/4px), intentional proportions, and "
         "controlled opacity. "
         "CRITICAL PRODUCT FRAMING: Never use arbitrary diagonal polygon clip-paths (`clip-path: polygon(...)`) "
         "on product photography or artwork. Diagonal polygon cuts slice through the client's products, candles, jars, and labels. "
         "Products must always remain intact, complete, and fully visible. Transparent cut-outs should float cleanly with natural "
-        "breathing room. Photographic cards should use clean rounded corners (`border-radius: 20px-36px`) or tall arches (`border-radius: 400px 400px 0 0`). "
+        f"breathing room. Photographic cards should use {card_shapes}. "
         "Avoid random floating shapes, decorative clutter, and stray measure lines that do not connect to the subject. "
         "Avoid random circles, generic pills, arbitrary "
         "solid rectangles, decorative counters and corner marks, equal-weight "
@@ -1615,8 +1849,8 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "offset, not the underlying grid. THE SAFE AREA: keep essential copy "
         f"inside {SAFE_AREA}. "
         "Use at most three typographic roles (display, support, micro-label) and "
-        "no more than two families. Let negative space carry as much weight as "
-        "the geometric mark."
+        "no more than two families. Let the space between elements carry as much "
+        "weight as the geometric mark."
         f"{swatch}"
         f"{(chr(10) + chr(10) + 'What the client asked for: ' + request) if request else ''}"
         "\n\nYou are writing a real web page. It is rendered in Chromium at "
@@ -2133,7 +2367,8 @@ def fallback_scene(script_scene: dict, seconds: float = 4.0) -> dict:
 
 def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
                assets_table: dict | None = None, check=None, log=None,
-               should_stop=None, on_scene=None, brand: dict | None = None) -> dict:
+               should_stop=None, on_scene=None, brand: dict | None = None,
+               measure=None, critic=None) -> dict:
     """Run the rest of the design conversation and return the finished spec.
 
     `ask(prompt, expect) -> str` sends a follow-up in the tab the design stage
@@ -2298,6 +2533,23 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
 
     if not scenes:
         raise ReelError("No scenes were written.")
+    if measure and len(scenes) > 1:
+        _repair_rhythm(scenes, design, ask, say, measure, check, assets_table)
+    if critic:
+        from .motion import critic as _critic
+
+        def _spec_of(rows):
+            out = {"design": design, "scenes": rows}
+            if assets_table:
+                out["_assets"] = assets_table
+            return out
+
+        def _keep(old, new):
+            new.setdefault("seconds", old.get("seconds"))
+            new.setdefault("cut", old.get("cut", ""))
+            new.setdefault("type", old.get("type", ""))
+
+        _critic.repair(scenes, _spec_of, ask, parse_scene, _keep, say, critic, SCENE_EXPECT)
     spec = {"design": design, "scenes": scenes}
     if assets_table:
         spec["_assets"] = assets_table
@@ -2762,6 +3014,7 @@ def still(spec: dict, at_frame: int, out_path: str) -> str:
                                 device_scale_factor=1)
         try:
             page.set_content(html, wait_until="load")
+            _browser.warm_fonts(page)
             try:
                 page.wait_for_function("document.fonts.ready.then(()=>true)",
                                        timeout=8000)

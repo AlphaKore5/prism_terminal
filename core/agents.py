@@ -48,18 +48,31 @@ CATEGORIES = {
         "emoji": "🧠",
         "color": "brains",
         "desc": "Strategy, factual grounding, deep reasoning & technical architecture",
-        "agents": ["Perplexity", "ChatGPT", "Claude", "LAZYCOOK"],
+        # Perplexity pulled from this list (2026-11-08, owner's own urgent
+        # call, same day): Chrome 157 crashes chromedriver natively every
+        # single time it tries Perplexity's own page, proven independent of
+        # cookies/cache/profile state (cleared and still 100% reproducible)
+        # — so leaving it in the fallback chain only ever burns 1-2 minutes
+        # crashing before whatever comes after it gets a turn. Put it back
+        # once a Chrome update fixes this; nothing else here changed.
+        "agents": ["ChatGPT", "Claude", "LAZYCOOK"],
     },
     "research": {
         "label": "Research & Academic",
         "emoji": "📚",
         "color": "research",
         "desc": "Peer-reviewed data, citations & symbolic mathematics",
-        # Perplexity leads here: live web search with sources is the research
-        # job most tasks actually need, and /boq's design-standards stage
-        # picks whatever is set for this category.
-        "agents": ["Perplexity", "Consensus", "WolframAlpha", "Semantic Scholar",
-                   "NotebookLM", "LAZYCOOK"],
+        # Narrowed to general-purpose chat tools (2026-11-08, owner's own
+        # urgent call): Consensus/WolframAlpha/Semantic Scholar/NotebookLM/
+        # LAZYCOOK dropped, Grok/Claude/ChatGPT added as the fallback chain.
+        # Perplexity itself was ALSO meant to lead this list that same day —
+        # live web search with sources is the research job most tasks
+        # actually need — but it was pulled again hours later (same owner
+        # call as "brains" above): Chrome 157 crashes chromedriver on its
+        # page every time, regardless of cookies/cache, so it is parked
+        # here, in this comment, rather than in the list, until Chrome
+        # fixes it. Grok leads in its place for now.
+        "agents": ["Grok", "Claude", "ChatGPT"],
     },
     # Its own category, not a corner of research. A contact database and a
     # web-search model are different machines: one returns rows that were
@@ -92,16 +105,24 @@ CATEGORIES = {
         "emoji": "🎨",
         "color": "visual",
         "desc": "Professional image generation, editable posts & consistent characters",
-        # Canva is first because most business visual work is a post or a
+        # Prism Image (FLUX 3 Klein via OpenRouter) is first, and so is the
+        # default roles.default_agents() hands a fresh install (2026-11-07):
+        # a direct API call, no browser tab, no separate sign-in, and it is
+        # a `local` agent so alternatives_for()'s browser-fallback chain
+        # skips straight past it to Canva/Gemini/etc, same as Reel/Studio/
+        # Motion already do for "media" and "presentation".
+        #
+        # Canva is next because most business visual work is a post or a
         # brochure the customer will want to tweak later, and it is the only
-        # tool here that hands back something still editable.
-        # Google Gemini sits second, not last: alternatives_for() offers the
-        # first TWO untried tools in this order when one fails, so parked at
-        # the end it would never actually be reached. This is what makes it
-        # the real fallback for ChatGPT -- the tool that has hit its own
-        # free-tier image limit twice in one afternoon on this account.
-        "agents": ["Canva", "Google Gemini", "Leonardo.ai", "Adobe Firefly",
-                   "Midjourney", "ChatGPT"],
+        # BROWSER tool here that hands back something still editable.
+        # Google Gemini sits after it, not last: alternatives_for() offers
+        # the first TWO untried (non-local) tools in this order when one
+        # fails, so parked at the end it would never actually be reached.
+        # This is what makes it the real fallback for ChatGPT -- the tool
+        # that has hit its own free-tier image limit twice in one afternoon
+        # on this account.
+        "agents": ["Prism Image", "Canva", "Google Gemini", "Leonardo.ai",
+                   "Adobe Firefly", "Midjourney", "ChatGPT"],
     },
     "media": {
         "label": "Video & Reels",
@@ -137,6 +158,53 @@ CATEGORIES = {
         "agents": ["Gamma.app", "Canva", "Tome", "Claude", "Claude Design"],
     },
 }
+
+
+def prune_for_server() -> None:
+    """Server mode: stop offering tools and categories Prism's plan does not
+    include (Canva, Midjourney, voice, decks, ...). Only the pickable lists
+    change; AGENT_REGISTRY and PIPELINE_ORDER stay, so an old saved plan that
+    still names one is skipped at run time with a plain message. Idempotent."""
+    from .server_session import _NO_SERVER_EQUIVALENT, _NO_SERVER_STAGES
+    for stage in _NO_SERVER_STAGES:
+        CATEGORIES.pop(stage, None)
+    for meta in CATEGORIES.values():
+        meta["agents"] = [n for n in meta["agents"]
+                          if n not in _NO_SERVER_EQUIVALENT]
+
+
+# Stages Prism fills in by itself in server mode when the person has not
+# picked a tool: there is no website to sign in to any more, so "no tool
+# chosen" is not a reason for a reel to come back as one picture.
+_SERVER_FILLED = ("research", "brains", "content", "visual", "media")
+_SERVER_LOCAL_DEFAULT = {"visual": "Prism Image", "media": "Prism Studio"}
+
+
+def server_effective(agents: dict | None) -> dict:
+    """The stage -> tool map a run really uses when AI runs on Prism's server.
+
+    Visual and video always have a local tool behind them (Prism Image;
+    Prism Studio / Reel / Motion), whatever website the saved config names
+    (ChatGPT, Runway, ...) or whether it names anything. The other writing
+    stages get the first tool of their category when none is set. Nothing is
+    written back to the config."""
+    from . import ai_client
+    out = {k: v for k, v in (agents or {}).items() if v}
+    if not ai_client.active():
+        return out
+    for stage in _SERVER_FILLED:
+        cat = CATEGORIES.get(stage)
+        if not cat:
+            continue
+        name = out.get(stage)
+        local = _SERVER_LOCAL_DEFAULT.get(stage)
+        if local:
+            if not name or not (AGENT_REGISTRY.get(name) or {}).get("local"):
+                if local in cat["agents"]:
+                    out[stage] = local
+        elif not name and cat["agents"]:
+            out[stage] = cat["agents"][0]
+    return out
 
 
 # The "summary" stage is not user-selectable; it reuses whichever agent the
@@ -852,6 +920,23 @@ AGENT_REGISTRY = {
     ),
 
     # ── Visual & Image ────────────────────────────────────────────────────────
+    # Runs INSIDE Prism — no browser, no ChatGPT/DALL-E account, no upload.
+    # Marked local so automation.py calls core.image_gen directly instead
+    # of driving a Chrome tab, same pattern as Prism Studio/Reel/Motion
+    # below. Default and first choice for the "visual" stage (2026-11-07,
+    # the owner's own call: "replace that particular step where usually
+    # chatgpt is responsible for the generation of images... with image
+    # generation through API key... FLUX 3 Klein... made that thing as the
+    # default and first choice") — CATEGORIES["visual"]["agents"] puts it
+    # first, and roles.default_agents() picks a category's first name for
+    # a fresh install.
+    "Prism Image": _agent(
+        "local://flux_image",
+        "a real generated picture in seconds from a written picture brief, "
+        "with no browser tab and no separate account to sign into",
+        "API key", "5–15s", 30,
+        local="flux_image",
+    ),
     "Leonardo.ai": _agent(
         "https://app.leonardo.ai",
         "fine-tuned model control and consistent character generation",
@@ -1153,6 +1238,11 @@ def alternatives_for(stage: str, tried: list | tuple = (),
     request this signal exists to keep away from Canva in the first
     place.
     """
+    from . import ai_client
+    if ai_client.active():
+        # Server mode has no other websites to hand a failed step to; a
+        # retry here would only spend the customer's credits again.
+        return []
     seen = {t for t in tried if t}
     if stage in ("visual", "presentation") and not wants_canva(query):
         seen.add("Canva")

@@ -96,15 +96,20 @@ class MotionEffects {
     const sy = spotPosY + camLagY;
     const sr = Math.max(this.w, this.h) * radiusFactor;
 
-    const grad = ctx.createRadialGradient(sx, sy, 36, sx, sy, sr);
-    grad.addColorStop(0,    spotColor);
-    grad.addColorStop(0.30, spotColor2);
-    grad.addColorStop(0.72, `rgba(${_hexToRgb(bg)}, 0.88)`);
-    grad.addColorStop(1,    `rgba(${_hexToRgb(bg)}, 1.0)`);
-
     ctx.save();
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, this.w, this.h);
+    // "none" = no spotlight at all. Not a transparent colour: a canvas gradient
+    // interpolates in non-premultiplied RGBA, so fading from transparent BLACK
+    // to the background passes through dark grey and draws a vignette ring.
+    if (!(spotColor === "none" && spotColor2 === "none")) {
+      const clear = `rgba(${_hexToRgb(bg)}, 0)`;
+      const grad = ctx.createRadialGradient(sx, sy, 36, sx, sy, sr);
+      grad.addColorStop(0,    spotColor  === "none" ? clear : spotColor);
+      grad.addColorStop(0.30, spotColor2 === "none" ? clear : spotColor2);
+      grad.addColorStop(0.72, `rgba(${_hexToRgb(bg)}, 0.88)`);
+      grad.addColorStop(1,    `rgba(${_hexToRgb(bg)}, 1.0)`);
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, this.w, this.h);
+    }
 
     // Secondary accent spotlight (optional — AI can provide)
     if (spot.accent) {

@@ -368,7 +368,8 @@ class MotionRuntime {
     this.effects = window.MotionEffects ? new window.MotionEffects(this.width, this.height) : null;
     if (spec.camera && spec.camera.tracks) this.camera.setTracks(spec.camera.tracks);
 
-    this._setupPostProcessing(spec.visual || {});
+    this._look = (p && p.look) || (spec.visual && spec.visual.look) || "tech";
+    this._setupPostProcessing(this._resolveLook(spec.visual || {}));
     this._setupTheme(p);
 
     this.stageEl.innerHTML = "";
@@ -439,6 +440,25 @@ class MotionRuntime {
     }
   }
 
+  // A look is a set of defaults for everything the backdrop paints on its own.
+  // Until 12 Nov 2026 there was only one, a dark-tech one (a cyan spotlight
+  // fading to navy, a scrolling grid, cyan particles, a 0.58 vignette, film
+  // grain), applied to EVERY film whatever its background — on a light page
+  // it turned the whole frame a blue-grey wash. "tech" is that look, kept
+  // exactly; "paper" and "ink" are flat. Explicit `visual` keys still win.
+  _resolveLook(visual) {
+    const none = "none";
+    const LOOKS = {
+      paper: { spotlight: { color: none, secondary: none }, grid: { enabled: false },
+               particles: { enabled: false }, vignette_strength: 0, grain_opacity: 0 },
+      ink:   { spotlight: { color: "rgba(255,255,255,0.05)", secondary: "rgba(255,255,255,0.02)" },
+               grid: { enabled: false }, particles: { enabled: false },
+               vignette_strength: 0.22, grain_opacity: 0.03 },
+    };
+    const preset = LOOKS[this._look];
+    return preset ? Object.assign({}, preset, visual) : visual;
+  }
+
   _setupPostProcessing(visual) {
     const vigStrength = visual.vignette_strength !== undefined ? visual.vignette_strength : 0.58;
     if (vigStrength > 0.001) {
@@ -481,7 +501,7 @@ class MotionRuntime {
     for (const layer of this.depthLayers || []) layer.applyParallax(this.camera, this.width, this.height);
 
     const visual = Object.assign({ background: this.background },
-      (this.spec && this.spec.visual) ? this.spec.visual : {});
+      this._resolveLook((this.spec && this.spec.visual) ? this.spec.visual : {}));
     const bctx = this.backdropCtx;
     bctx.setTransform(1, 0, 0, 1, 0, 0);
     if (this.effects) {

@@ -21,6 +21,34 @@ import webbrowser
 from . import agents as A
 from . import config as C
 from . import ui
+from . import ai_client as _ai
+from . import server_session as _SS
+
+def _server_aware(neutral):
+    """In server mode `driver` is a ServerSession, not a browser. A helper that
+    would have touched the page answers `neutral` instead: a value, or a
+    function of (driver, *args, **kwargs). See core/server_session.py."""
+    import functools
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(driver, *a, **k):
+            if _SS.is_session(driver):
+                return neutral(driver, *a, **k) if callable(neutral) else neutral
+            return fn(driver, *a, **k)
+        return wrapper
+    return deco
+
+
+def _ss_reask(driver, agent_cfg, prompt, expect="", wait=0, should_stop=None):
+    try:
+        return [driver.send(prompt)]
+    except _ai.AiError as e:
+        driver.last_error = _ai.plain(e)
+        ui.warn(f"   {driver.last_error}")
+        return []
+
+
 
 def _chrome_binaries() -> list[str]:
     """Where Chrome might be, on this machine specifically.
@@ -111,6 +139,13 @@ def _get_driver(cfg: dict):
     """Return (driver, fresh) — reusing the still-open browser from a
     previous run when possible, so results left on screen aren't disturbed."""
     global _active_driver
+    if _ai.active():
+        # Server mode: every AI step is a call to Prism's server. Reaching
+        # this line is a bug in the caller, and a loud one beats a Chrome
+        # window opening on a customer's desktop.
+        raise RuntimeError("Prism AI runs on Prism's server and never opens "
+                           "a browser. (This is a bug: please tell Prism "
+                           "support.)")
     if _active_driver is not None:
         try:
             _active_driver.window_handles  # cheap liveness probe
@@ -1418,6 +1453,7 @@ return hits.length;
 """
 
 
+@_server_aware(0)
 def _clear_staged_attachments(driver, agent_cfg, agent_name: str = "") -> int:
     """Take off whatever the composer already holds before this stage's own
     files go up. Returns how many chips were removed (-1: no composer found).
@@ -1614,6 +1650,7 @@ def _verify_page_attachments(driver, basenames: list[str], timeout: float = 6.0)
     return count, matched, err
 
 
+@_server_aware(lambda d, agent_cfg, atts, agent_name='': d.add_files(atts))
 def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
     """Push any attached files into the tool's <input type='file'>, if present.
 
@@ -2003,6 +2040,7 @@ def _within(selector_list: str, descendant: str) -> str:
     return ", ".join(f"{p.strip()} {descendant}" for p in parts if p.strip())
 
 
+@_server_aware([])
 def _harvest_images(driver, agent_cfg, stage: str,
                     exclude_files: list | None = None) -> list[dict]:
     """A generated image can't travel in a text handoff. Pull every real image
@@ -2363,6 +2401,7 @@ def _safe_filename(name: str) -> str:
     return name[:120]
 
 
+@_server_aware([])
 def _harvest_files(driver, agent_cfg, stage: str, ignore_names=(),
                    click_fallback: bool = True) -> list[dict]:
     """Non-image sibling of _harvest_images. A code, presentation or format
@@ -2625,6 +2664,7 @@ _FILE_HINT_RE = re.compile(
                               for ext in _HARVESTABLE_EXTS) + r")\b", re.I)
 
 
+@_server_aware([])
 def _harvest_stage_files(driver, agent_cfg, stage: str, texts,
                          attachments=None) -> list[dict]:
     """Every file a stage produced, on ANY stage.
@@ -2700,6 +2740,40 @@ def _doc_stem(text: str, stage: str) -> str:
     return _safe_filename(stage or "document")
 
 
+def _file_tool_step(driver, stage: str, query: str, task: str, text: str,
+                    ext: str) -> dict | None:
+    """The create_file tool loop for a server step. Returns _meet_contract's
+    result shape, or None when it could not even start (so the Markdown path
+    still gets its turn)."""
+    import tempfile
+    from . import ai_client, filespec
+    out: dict = {"files": [], "texts": [], "note": "", "missing": ""}
+    try:
+        folder = tempfile.mkdtemp(prefix="prism-doc-")
+        res = filespec.run_file_tool(
+            ai_client.chat, query or task, text, max_turns=3, out_dir=folder,
+            role=getattr(driver, "role", "") or "writer",
+            addon=getattr(driver, "addon", "core"), feature="file_tool",
+            ext=ext)
+    except ai_client.AiError as e:
+        ui.warn(f"   couldn't make the file ({e})")
+        out["missing"] = str(e)
+        return out
+    except Exception as e:                                  # noqa: BLE001
+        ui.warn(f"   the file tool failed ({e})")
+        return None
+    if not res.ok:
+        ui.warn(f"   no file made: {res.message}")
+        out["missing"] = res.message
+        return out
+    out["files"] = res.files
+    out["note"] = ("Prism made this file on your computer from the AI's "
+                   "structured answer" if not res.fallback else res.message)
+    ui.ok(f"   📊  {out['note']} — "
+          + ", ".join(f["name"] for f in res.files))
+    return out
+
+
 def _meet_contract(driver, agent_cfg: dict, stage: str, kind: str,
                    texts: list, made: list, *, query: str = "",
                    task: str = "", attachments=None, should_stop=None) -> dict:
@@ -2730,6 +2804,16 @@ def _meet_contract(driver, agent_cfg: dict, stage: str, kind: str,
 
     ext = _c.wanted_ext(query)
     ask = _c.reask(kind, ext=ext, query=query, task=task)
+    if _SS.is_session(driver):
+        ask = ""        # a server chat cannot attach a file; write it ourselves below
+        best_text = max((t for t in texts if (t or "").strip()), key=len, default="")
+        if kind == "file" and _c.wants_structured(ext, best_text):
+            # Spreadsheets, CSV and documents with tables: the model returns
+            # JSON through the create_file tool and Prism builds the file
+            # (core/filespec.py). Markdown below stays for plain prose.
+            tool = _file_tool_step(driver, stage, query, task, best_text, ext)
+            if tool is not None:
+                return tool
     halted = should_stop or (lambda: False)
     if (ask and driver is not None and agent_cfg.get("textarea_selector")
             and not halted()):
@@ -2989,6 +3073,7 @@ def _click_download_control(driver, agent_cfg: dict) -> bool:
     return _click_by_text(driver, ["download"], timeout=4)
 
 
+@_server_aware(False)
 def _current_chatgpt_file_card(driver) -> bool:
     """Whether the newest ChatGPT reply already contains a generated file.
 
@@ -3181,6 +3266,13 @@ def _save_artifacts(items: list[dict], query: str, stage: str,
             continue
         item["_saved"] = saved
         ui.info(f"   💾  saved to {saved}")
+        # A file Prism built from a spec keeps the spec beside it, so a later
+        # "make it a CSV" converts the data, not the document (core/filespec).
+        if item.get("spec") and os.path.isfile(item["spec"]):
+            try:
+                shutil.copyfile(item["spec"], saved + ".spec.json")
+            except OSError:
+                pass
 
 
 # Phrases that only ever appear in what Prism types, never in a tool's answer.
@@ -3221,6 +3313,7 @@ def _is_prompt_echo(text: str) -> bool:
     return sum(m in low for m in _PROMPT_ECHO_SOFT) >= 2
 
 
+@_server_aware('')
 def _safe_url(driver, exclude=()) -> str:
     """The current tab's URL, for the paths where the stage blew up. Never
     raises (the session itself may be what died) and never returns a link that
@@ -3254,6 +3347,7 @@ def _sleep_interruptibly(seconds: float, should_stop=None) -> bool:
     return should_stop()
 
 
+@_server_aware((0, True))
 def _smart_wait(driver, agent_cfg, cap: int, poll: int = 1,
                 stable_for: float = 2.5, min_wait: int = 3,
                 expect: str = "", should_stop=None) -> tuple[int, bool]:
@@ -3409,6 +3503,7 @@ EMPTY_TURN_AFTER = 20
 EMPTY_TURN_PATIENCE = 15
 
 
+@_server_aware(False)
 def _regenerate_once(driver, agent_cfg: dict) -> bool:
     """Press the tool's own "regenerate" on an empty answer, once.
 
@@ -3443,6 +3538,7 @@ def _regenerate_once(driver, agent_cfg: dict) -> bool:
     return clicked
 
 
+@_server_aware(0)
 def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
                      grace: int | None = None, should_stop=None,
                      baseline_count: int | None = None) -> int:
@@ -3587,6 +3683,7 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
     return last
 
 
+@_server_aware(False)
 def _chatgpt_is_busy(driver) -> bool:
     """True if ChatGPT is actively generating an image or answer."""
     try:
@@ -3600,6 +3697,7 @@ def _chatgpt_is_busy(driver) -> bool:
         return False
 
 
+@_server_aware(0)
 def _wait_for_files(driver, cap: int = 60, grace: int = 12,
                     stage: str = "") -> int:
     """_wait_for_images's twin for document/deck/code deliverables.
@@ -3918,7 +4016,9 @@ def motion_script(all_responses: dict) -> str:
     return ""
 
 
-def motion_turn_one(query: str, skeleton: str, all_responses: dict) -> str:
+def motion_turn_one(query: str, skeleton: str, all_responses: dict,
+                    brand: dict | None = None, look: str = "",
+                    kit: dict | None = None, has_logo: bool = False) -> str:
     """The motion writer's rebuilt first prompt — the storyboard turn with
     the script threaded in — or "" when no script was written, in which
     case the planned prompt stands."""
@@ -3927,7 +4027,8 @@ def motion_turn_one(query: str, skeleton: str, all_responses: dict) -> str:
         return ""
     from .motion import generate as _motion_gen
     return _motion_gen.storyboard_instructions(
-        query, skeleton=skeleton or "cinematic_glass", script=script)
+        query, brand=brand or None, skeleton=skeleton or "cinematic_glass",
+        script=script, look=look, kit=kit, has_logo=has_logo)
 
 
 def _keep_failed_spec(sources) -> str:
@@ -5208,6 +5309,7 @@ _EXHAUSTED_MARKERS = (
 )
 
 
+@_server_aware('')
 def _looks_exhausted(driver) -> str:
     """"" if the tool is fine, else why it cannot answer right now.
 
@@ -5237,6 +5339,7 @@ def _looks_exhausted(driver) -> str:
     return ""
 
 
+@_server_aware('')
 def _looks_signed_out(driver) -> str:
     """"" if the page looks usable, else what the user has to do about it.
 
@@ -5267,6 +5370,7 @@ def _looks_signed_out(driver) -> str:
     return ""
 
 
+@_server_aware('')
 def _looks_unreadable(driver, questions, timed_out: bool = False) -> str:
     """"" unless the page holds a real conversation we could not read.
 
@@ -5339,6 +5443,7 @@ def _clean_capture(text: str) -> str:
     return t.strip()
 
 
+@_server_aware(lambda d, agent_cfg, keep='': list(d.captures))
 def _capture(driver, agent_cfg: dict, keep: str = "") -> list[str]:
     """Everything on the page that reads as a reply, longest captures only.
 
@@ -5404,6 +5509,7 @@ def _capture(driver, agent_cfg: dict, keep: str = "") -> list[str]:
 _EDITABLE_STAGES = ("visual", "presentation")
 
 
+@_server_aware(lambda d, agent_cfg, stage, query, stage_responses, **k: (stage_responses, ''))
 def _make_editable(driver, agent_cfg: dict, stage: str, query: str,
                    responses: list,
                    machine_shaped: bool = False,
@@ -5538,6 +5644,7 @@ def _design_turn_text(driver, agent_cfg: dict, texts: list, web, ask) -> str:
     return texts[-1] if texts else got
 
 
+@_server_aware(_ss_reask)
 def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "",
            wait: int = 0, should_stop=None) -> list[str]:
     """Send one follow-up in the SAME tab and re-scrape.
@@ -5675,7 +5782,10 @@ def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
         # way the imagery stage's are, then adopted into the reel's artwork.
         maker = (cfg.get("agents") or {}).get("visual") or "ChatGPT"
         maker_cfg = A.resolve_agent("visual", maker)
-        if not maker_cfg:
+        if _ai.active():
+            ui.warn("   " + _SS.not_in_plan("Making new pictures inside a "
+                    "follow-up") + " Going on without.")
+        elif not maker_cfg:
             ui.warn(f"   {maker} can't make pictures here — going on without")
         else:
             emit("stage_start", {"stage": "artwork", "agent": maker})
@@ -5780,10 +5890,16 @@ def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
     ui.rule(f"DESIGN  ·  {agent_name}  ·  follow-up",
             style=A.CATEGORIES.get("design", {}).get("color", "pink"))
     if driver is None:
-        driver, _ = _get_driver(cfg)
-    _open_tab(driver, agent_name)
-    driver.get(design_url)
-    _time.sleep(agent_cfg.get("page_wait", 4))
+        if _ai.active():
+            driver = _SS.ServerSession()
+        else:
+            driver, _ = _get_driver(cfg)
+    if _SS.is_session(driver):
+        driver.begin("design", agent_name, "code")
+    else:
+        _open_tab(driver, agent_name)
+        driver.get(design_url)
+        _time.sleep(agent_cfg.get("page_wait", 4))
     wait = followup_wait(agent_cfg)
 
     # Upload newly generated/attached artwork to the reopened design conversation
@@ -5880,6 +5996,16 @@ def _brand_from_images(files: list) -> dict:
     return (_pillow.sample_brand(imgs) or {}) if imgs else {}
 
 
+def _film_look(query: str) -> str:
+    """The art direction this run's film takes (core.looks): the one the client
+    named, else one the last few films did not use. Recorded so the next film
+    is steered away from it."""
+    from . import looks as _looks
+    name = _looks.pick(query, _looks.recent())
+    _looks.remember(name)
+    return name
+
+
 def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
                 studio: dict | None = None):
     """Film the page the art-direction stage wrote.
@@ -5910,7 +6036,11 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
             spec = web.parse_spec(text)
             break
         except Exception as e:
-            why_bad = why_bad or e
+            # Keep the most telling reason: "No JSON found" from an earlier
+            # stage's prose (a caption, "drew 5 images") hid "the scenes carry
+            # no markup" from the one candidate that was close (19 Nov 2026).
+            if why_bad is None or "No JSON found" in str(why_bad):
+                why_bad = e
     if spec is None:
         # Keep what actually came back. Without this the one piece of evidence
         # that could explain the failure is discarded at the moment it becomes
@@ -6543,14 +6673,69 @@ def _run_footage(prior_text, attachments, cfg: dict, on_progress=None):
     return out, f"client footage edited — {os.path.basename(out)} ({', '.join(details)})"
 
 
+def _critic_look(cfg: dict, frames_of, ui=None, cap: float = 0.10):
+    """The vision critic as the `critic` callable build_spec takes, or None when
+    it is off (config motion_critic + an OpenRouter key: the same explicit choice
+    the BOQ add-on asks before it sends a drawing). Remembers what it has spent;
+    once over `cap` dollars it answers None, which the repair loop reads as
+    "could not look", never as "fixed"."""
+    from .motion import critic as _critic
+    if not _critic.enabled(cfg):
+        return None
+    spent = [0.0]
+
+    def look(spec):
+        if spent[0] >= cap:
+            return None
+        got = _critic.critique(frames_of(spec), cfg, max_cost=cap)
+        spent[0] += got.get("cost") or 0.0
+        if got.get("skipped") and not got.get("defects"):
+            return None
+        if ui:
+            ui.info(f"   critic: ${spent[0]:.3f} spent")
+        return got["defects"]
+
+    return look
+
+
+def _motion_skeleton(explicit: str, cfg) -> str:
+    """Which Motion story profile a run uses: the caller's own choice, else
+    config `motion_skeleton` ("story" is the five-part grammar for any
+    business, see core.motion.story; "blocks" composes the film from the
+    tested block library, see core.motion.blocks), else the cinematic profile that has always
+    been the default. Changing the default is a product decision, so it stays a
+    one-line change here."""
+    allowed = ("cinematic_glass", "story", "brand_launch", "spine", "blocks")
+    chosen = explicit or (cfg.get("motion_skeleton") if isinstance(cfg, dict) else "")
+    return chosen if chosen in allowed else "cinematic_glass"
+
+
 def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
                brand: dict | None = None, studio: dict | None = None,
-               on_progress=None):
+               on_progress=None, query: str = "", skill_text: str = ""):
     """Execute an agent that lives in Prism rather than in a browser.
 
     prior_text is either a single string or the earlier stages' outputs,
     newest first — each is tried in turn so one prose-heavy stage can't hide
     the spec written by another.
+
+    `query` is the RUN's own task text — the original ask, or (on a
+    follow-up) main_window's `self._followup_text`, "use this logo" and
+    nothing else. Reel/Studio/Motion never needed it (a design stage ahead
+    of them writes a full spec INTO prior_text instead); "flux_image" does
+    — it has no design stage of its own, so without this a follow-up's
+    real instruction never reached FLUX, only whichever prior stage's
+    leftover text _prompt_from happened to grab (see core.image_gen).
+
+    `skill_text` (2026-11-08): the house doctrine core.skills.block()
+    already renders for a browser agent's own stage, threaded here too —
+    "flux_image" is the only local agent that reads it (see
+    core.image_gen.generate), because it is the only one with no design
+    stage of its own to have already absorbed an occasion-specific skill
+    (a particular festival, a product-launch post, a sale announcement,
+    ...). The caller decides which skill(s) apply, same
+    SK.keys_for(routing, stage) + SK.block() every browser stage already
+    uses — this function only ever passes the rendered text through.
 
     Returns (output_path, message). On failure the path is empty and the
     message explains what went wrong — a local stage must degrade the same
@@ -6566,6 +6751,10 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
         return _run_studio(prior_text, attachments, cfg, brand, studio=studio)
     if kind == "motion":
         return _run_motion(prior_text, attachments, cfg, brand)
+    if kind == "flux_image":
+        from . import image_gen as _image_gen
+        return _image_gen.generate(query, prior_text, cfg, attachments,
+                                   skill_text=skill_text)
     if kind != "reel":
         return "", f"Unknown local agent {kind!r}."
     try:
@@ -6748,7 +6937,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         if on_event:
             on_event(kind, payload)
 
-    agents = {k: v for k, v in (cfg.get("agents") or {}).items() if v}
+    agents = A.server_effective(cfg.get("agents"))
     stages = list(custom_stages) if custom_stages is not None else list(_needed_stages(routing, agents))
     if not stages:
         ui.warn("Router marked every stage as not-needed — nothing to run.")
@@ -6880,6 +7069,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     research_stage = ""
     studio_brand: dict = {}
     design_assets: dict = {}
+    # The client's identity (core.brandkit) and this film's art direction
+    # (core.looks), shared by Studio and Motion. The direction is chosen once,
+    # by whichever film stage is planned first.
+    from . import brandkit as _brandkit
+    film_kit = _brandkit.from_config(cfg)
+    film_look = ""
+    motion_brand: dict = {}
+    motion_has_logo = False
     # Stages whose reply is READ BY A PROGRAM, not handed to another chat.
     # The pipeline's normal rules demand a prose "HANDOFF FOR <next agent>"
     # section as the last thing in the answer, which flatly contradicts "reply
@@ -6945,6 +7142,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # stage is already on their website — asking for the hex codes
             # while it is there costs nothing, where having Prism open the
             # site again to sample it would cost a whole extra page load.
+            # Colours the client typed into their brand kit win over ones
+            # measured off this run's attachments.
+            brand = _brandkit.colours(film_kit, brand)
             if not brand:
                 # `ragent`, not `an`: reusing the writer's name here rebound it
                 # and the plan banner then credited the script to whichever
@@ -7010,10 +7210,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # run. A token stands in and is substituted the moment before this
             # prompt is typed.
             studio_brand = dict(brand or {})
+            film_look = film_look or _film_look(query)
+            ui.info(f"🎨  art direction for this reel: {film_look}")
             stages.insert(studio_at, ("design", director,
                                       [_web.design_instructions(
                                           brand or None, query,
-                                          _web.ASSET_TOKEN)]))
+                                          _web.ASSET_TOKEN,
+                                          look=film_look, kit=film_kit)]))
             studio_at += 1
             design_feeder = studio_at - 1
             script_stage = stages[writer][0]
@@ -7069,9 +7272,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         else:
             try:
                 from . import reel as _reel
+                from . import length as _length
                 st, an, qs = stages[feeder]
                 stages[feeder] = (st, an, qs[:-1] + [
-                    qs[-1] + "\n\n" + _reel.spec_instructions()])
+                    qs[-1] + "\n\n" + _reel.spec_instructions(
+                        requested=_length.requested_seconds(query))])
                 spec_feeder = feeder
                 ui.info(f"🎬  {stages[local_reel_at][1]} renders locally — "
                         f"{an} will write the scene spec for it")
@@ -7140,11 +7345,23 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 motion_at += 1
                 ui.info(f"🖼️   {maker_m} will make up to "
                         f"{_web_m.MAX_GENERATED} images for the motion graphic")
+            # Motion was never told the client's colours at all (the
+            # parameter existed; nothing passed it). Same reading Studio uses.
+            motion_brand = _brandkit.colours(film_kit, _brand_from_images(attachments or []))
+            try:
+                from . import assets as _assets_m
+                motion_has_logo = "logo" in _assets_m.collect(attachments or [])
+            except Exception:                              # noqa: BLE001
+                motion_has_logo = False
+            film_look = film_look or _film_look(query)
+            ui.info(f"🎨  art direction for this motion graphic: {film_look}"
+                    + (f" — brand accent {motion_brand.get('accent')}" if motion_brand else ""))
             stages.insert(motion_at, ("motion_plan", planner,
                                       [_motion_gen.storyboard_instructions(
-                                          query,
-                                          skeleton=motion_skeleton or
-                                          "cinematic_glass")]))
+                                          query, brand=motion_brand or None,
+                                          skeleton=_motion_skeleton(motion_skeleton, cfg),
+                                          look=film_look, kit=film_kit,
+                                          has_logo=motion_has_logo)]))
             motion_at += 1
             motion_feeder = motion_at - 1
             machine_stages[motion_feeder] = (
@@ -7180,7 +7397,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         C.continue_run(cur_dir, task=query, title=run_title)
     else:
         C.begin_run(query, title=run_title)
-    driver, fresh = _get_driver(cfg)
+    if _ai.active():
+        # Server mode: no Chrome, ever. Every AI step is a call through
+        # Prism's server (core/server_session.py).
+        driver, fresh = _SS.ServerSession(), True
+    else:
+        driver, fresh = _get_driver(cfg)
     all_responses: dict[str, list[str]] = {
         k: list(v) if isinstance(v, list) else [str(v)]
         for k, v in (prior_responses or {}).items()
@@ -7246,10 +7468,77 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         # blob only gives the parser more prose to trip over.
         prior_text = [t for ts in reversed(list(all_responses.values()))
                       for t in ts if t.strip()]
+
+        # The "artwork" stage is not a single-file renderer like Reel/
+        # Studio/Motion — it is several SEPARATE pictures (core.reel_web's
+        # own MAX_GENERATED), each needing a prompt complete enough for a
+        # model with no web access and no memory of this conversation.
+        # FLUX cannot write that prompt itself (it cannot browse, and
+        # "Dhanteras" or "this company in Vadodara" means nothing to a
+        # picture-only model) — core.image_gen.generate_artwork splits
+        # that into a text pass (writes N self-contained briefs, may use
+        # whatever a real research stage already found) and then an image
+        # pass per brief, cut out with core.assets the same way a client's
+        # own flat-background logo already is. Handled entirely here,
+        # never falling through to the single-file path below.
+        if stage == "artwork" and agent_cfg.get("local") == "flux_image":
+            from . import image_gen as _image_gen
+            has_own_artwork = any(
+                str(a.get("path", "")).lower().endswith(
+                    (".png", ".jpg", ".jpeg", ".webp", ".bmp"))
+                for a in (attachments or []))
+            # A reel or motion graphic (film_look is set by whichever film
+            # stage was planned) gets whole scene pictures in its own art
+            # direction and colours; any other use keeps the cut-out subjects.
+            paths, note = _image_gen.generate_artwork(
+                query, prior_text, cfg, has_own_artwork=has_own_artwork,
+                film=bool(film_look), look=film_look,
+                brand=studio_brand or motion_brand or None)
+            if not paths:
+                ui.err(note)
+                emit("stage_error", {"stage": stage, "error": note, "url": ""})
+                return
+            made = [{"path": p, "kind": "image", "name": os.path.basename(p)}
+                    for p in paths]
+            audio_in_pipeline = [
+                f for f in pipeline_files
+                if f.get("kind") == "audio" or str(f.get("path", "")).lower()
+                .endswith((".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"))]
+            from . import reel_web as _rw
+            pipeline_files[:] = audio_in_pipeline + made[-_rw.MAX_GENERATED:]
+            _save_artifacts(made, query, stage, link="")
+            all_responses[stage] = [note]
+            all_links[stage] = paths[0]
+            delivered["image"] = delivered.get("image", 0) + len(paths)
+            ui.ok(note)
+            for p in paths:
+                ui.info(f"   📁  {p}")
+            emit("stage_done", {"stage": stage, "count": len(paths),
+                                "texts": [note], "url": paths[0],
+                                "timed_out": False})
+            return
+
         # Images an earlier stage GENERATED count as artwork too — that is
         # the whole point of harvesting them. The client's own files come
         # first so their real mark wins the 'logo' slot over anything a
         # model drew.
+        #
+        # House doctrine for THIS stage (2026-11-08), same mechanism a
+        # browser agent's own prompt already gets below (SK.keys_for() +
+        # SK.block()) — flux_image (Prism Image) is the only local agent
+        # that reads it: a single generic design brief cannot cover every
+        # occasion a customer asks for (a festival, a product launch, a
+        # sale, a hiring post, ...) equally well, and a skill is exactly
+        # Prism's own existing mechanism for "different doctrine for a
+        # different kind of deliverable" — this just reaches a local
+        # renderer with it too, not only a browser tab. maker=True: an
+        # image step builds the thing, it does not write one out as text
+        # (see SK.block()'s own maker= docstring).
+        _visual_skill_keys = SK.keys_for(routing, stage)
+        _visual_skill_text = (SK.block(_visual_skill_keys, "browser", maker=True)
+                              if _visual_skill_keys else "")
+        if _visual_skill_text:
+            ui.info(f"   📘  skill: {', '.join(_visual_skill_keys)}")
         out, note = _run_local(agent_cfg["local"], prior_text,
                                (attachments or []) + pipeline_files,
                                cfg, stage, brand=studio_brand,
@@ -7257,7 +7546,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                    stages, stage, all_links),
                                on_progress=lambda d, t: emit(
                                    "local_progress", {"stage": stage,
-                                                      "done": d, "total": t}))
+                                                      "done": d, "total": t}),
+                               query=query, skill_text=_visual_skill_text)
         if out:
             candidates = []
             for item in (pipeline_files or []):
@@ -7296,18 +7586,27 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     emit("stage_error", {"stage": stage, "error": error,
                                          "url": out})
                     return
-            # Keep the internal reel_<timestamp> working name, but make
-            # the customer-facing artifact describe the original request.
+            # Keep the internal reel_<timestamp>/flux_<timestamp> working
+            # name, but make the customer-facing artifact describe the
+            # original request. A local renderer's own file extension says
+            # what it made -- FLUX 3 Klein (the "visual" stage's own local
+            # agent, see agents.py's "Prism Image") writes a .png, Reel/
+            # Studio/Motion write an .mp4 -- so one flag covers both the
+            # artifact's label and the delivered-count bucket without
+            # threading the local `kind` string all the way down here.
+            is_image = out.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
             try:
                 from . import config as _config
-                saved = _config.save_artifact(out, query, kind="reel",
-                                             task=query)
+                saved = _config.save_artifact(
+                    out, query, kind="image" if is_image else "reel",
+                    task=query)
                 ui.info(f"   💾  saved to {saved}")
             except Exception:                           # noqa: BLE001
                 pass       # rendering succeeded; copying is best-effort
             all_responses[stage] = [note]
             all_links[stage] = out
-            delivered["video"] = delivered.get("video", 0) + 1
+            bucket = "image" if is_image else "video"
+            delivered[bucket] = delivered.get(bucket, 0) + 1
             ui.ok(note)
             ui.info(f"   📁  {out}")
             emit("stage_done", {"stage": stage, "count": 1, "texts": [note],
@@ -7393,6 +7692,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         a transient browser failure from cancelling the whole client reel.
         """
         nonlocal driver, first_tab
+        if _SS.is_session(driver):
+            driver.begin(stage, agent_name, _SS.role_for(
+                stage, agent_name,
+                feeder=(stage_idx in (design_feeder, motion_feeder, spec_feeder))))
+            return
         target = agent_cfg["url"]
         res_cand = (resume_urls or {}).get(stage)
         if res_cand:
@@ -7506,7 +7810,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # the writer plans its own story (the Alphakore run, 10 Sep
             # 2026, invented a slogan per scene while the script sat unused
             # one stage earlier).
-            rebuilt = motion_turn_one(query, motion_skeleton, all_responses)
+            rebuilt = motion_turn_one(query, motion_skeleton, all_responses,
+                                      brand=motion_brand, look=film_look,
+                                      kit=film_kit, has_logo=motion_has_logo)
             if rebuilt:
                 questions = [rebuilt]
 
@@ -7522,6 +7828,22 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                           "this step was left out. Pick a different tool for "
                           "it in the plan."})
             continue
+
+        if _SS.is_session(driver):
+            # Server mode. A picture-only site becomes Prism's own picture
+            # step; a tool with no server equivalent is shown as left out.
+            _swap = _SS.redirect_agent(stage, agent_name, agent_cfg)
+            if _swap:
+                ui.info(f"   {agent_name} is replaced by {_swap} (runs on "
+                        "your Prism plan).")
+                agent_name = _swap
+                agent_cfg = A.resolve_agent(stage, agent_name) or agent_cfg
+            _why = _SS.unsupported_reason(stage, agent_name, agent_cfg)
+            if _why:
+                ui.warn(f"   {_why}")
+                emit("stage_skipped", {"stage": stage, "agent": agent_name,
+                                       "reason": _why})
+                continue
 
         # A browser stage with no prompt is the run that uploads the files,
         # asks nothing, and waits the whole cap for an answer to a question
@@ -8040,6 +8362,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                 full_prompt = _maker_brief(agent_name, agent_cfg) + full_prompt
                                 full_prompt = _chat_header(run_title, stage) + full_prompt
                         full_prompt = _bmp_safe(full_prompt)  # strip emoji ChromeDriver can't type
+                        if _SS.is_session(driver):
+                            try:
+                                driver.send(full_prompt)
+                            except _ai.AiError as e:
+                                driver.last_error = _ai.plain(e)
+                                ui.err(f"   {driver.last_error}")
+                                nothing_was_sent = True
+                                break
+                            continue
                         prompt_phase = "waiting for the message box"
                         textarea = WebDriverWait(
                             driver, agent_cfg.get("input_wait", 15)).until(
@@ -8197,6 +8528,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     note = (f"{agent_name} never received the prompt, so there "
                             "is nothing to wait for. Its tab is open if you "
                             "want to send it by hand.")
+                    if _SS.is_session(driver):
+                        note = driver.last_error or "Prism's server did not answer."
                     ui.err(f"   {note}")
                     all_links[stage] = _safe_url(driver, exclude=tuple(
                         all_links.values()))
@@ -8206,9 +8539,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     # _retry_failed_stages can pick this stage up like any
                     # other — a prompt that never landed is exactly the kind
                     # worth retrying.
-                    failures[stage] = {"agent": agent_name,
-                                       "questions": questions,
-                                       "reason": note, "exhausted": False}
+                    if not _SS.is_session(driver):
+                        failures[stage] = {"agent": agent_name,
+                                           "questions": questions,
+                                           "reason": note, "exhausted": False}
                     continue
 
                 # A promised image is not a text answer. ChatGPT commonly
@@ -8544,6 +8878,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             script=script_txt, assets=listing,
                             assets_table=design_assets,
                             check=_web.inspect, brand=studio_brand,
+                            measure=_web.rhythm_probe,
+                            critic=_critic_look(cfg, _web.settled_frames, ui),
                             log=lambda m: ui.info(f"   {m}"),
                             should_stop=stage_halt,
                             on_scene=lambda i, n: emit(
@@ -8580,7 +8916,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 if stage_idx == motion_feeder and texts:
                     from . import motion as _motion_pkg
                     from .motion import generate as _motion
-                    from .motion import inspect as _motion_inspect
+                    from .motion import measure as _motion_measure
+                    from .motion import rhythm as _motion_rhythm
+                    from .motion import critic as _critic_mod
                     from . import assets as _assets
 
                     scene_wait = max(int(agent_cfg.get("wait_time", 60)), 180)
@@ -8619,8 +8957,16 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             texts[-1], _ask,
                             assets=motion_assets_listing,
                             assets_table=motion_assets_table,
-                            skeleton=motion_skeleton or "cinematic_glass",
-                            check=_motion_inspect.inspect,
+                            skeleton=_motion_skeleton(motion_skeleton, cfg),
+                            # What the client supplied: their words and their
+                            # kit. A name or number from the kit is theirs to show.
+                            request=(query + "\n" + _brandkit.corpus(film_kit)).strip(),
+                            measure=_motion_rhythm.probe,
+                            critic=_critic_look(cfg, _critic_mod.settled_frames, ui),
+                            # The estimate plus, when a browser is here, the
+                            # scene laid out for real with the camera applied
+                            # (core.motion.measure — the 11 Nov 2026 study's M4).
+                            check=_motion_measure.inspect_all,
                             log=lambda m: ui.info(f"   {m}"),
                             should_stop=stage_halt,
                             on_scene=lambda i, n: emit(
@@ -8645,6 +8991,47 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         else:
                             ui.ok(f"   {len(validated['scenes'])} scene(s) "
                                   "written")
+                            # Whatever the model wrote, no line is left wider
+                            # than the frame (core.motion.measure.fit_to_frame).
+                            # A browser problem here must never cost the run.
+                            try:
+                                validated, _fits = _motion_measure.fit_to_frame(validated)
+                                for _f in _fits:
+                                    ui.info(f"   ↔  fitted {_f}")
+                            except Exception as _e:
+                                ui.warn(f"   couldn't check the text fits the frame ({_e})")
+                            # The film's own sound, generated from its timeline
+                            # (core.motion.sfx): a tick per typed character, a
+                            # click per press, a whoosh per camera move. On by
+                            # default for films made here; "none" turns it off.
+                            validated.setdefault("project", {}).setdefault("sound", "ui")
+                            # How the film breathes: holds and bursts, measured
+                            # at low resolution in the real runtime. Reported,
+                            # not repaired — fixing it means asking the writer
+                            # again, which only the API path can do cheaply.
+                            try:
+                                from .motion import rhythm as _rhythm
+                                for _f in _rhythm.faults(_rhythm.probe(validated)):
+                                    ui.warn(f"   ♪  rhythm: {_f}")
+                            except Exception as _e:
+                                ui.warn(f"   couldn't measure the film's rhythm ({_e})")
+                            # A vision model's look at each scene's settled frame
+                            # (core.motion.critic). OFF unless config `motion_critic`
+                            # is true: it sends frames of the client's film to a
+                            # third party and spends the customer's OpenRouter credit
+                            # (about $0.001 a film). Reported, not repaired.
+                            try:
+                                from .motion import critic as _critic
+                                if _critic.enabled(cfg):
+                                    _r = _critic.critique(_critic.settled_frames(validated), cfg)
+                                    if _r["skipped"]:
+                                        ui.warn(f"   👁  critic: {_r['skipped']}")
+                                    else:
+                                        ui.info(f"   👁  critic: {len(_r['defects'])} point(s), ${_r['cost']:.4f}")
+                                        for _f in _critic.faults(_r["defects"])[:8]:
+                                            ui.warn(f"   👁  {_f}")
+                            except Exception as _e:
+                                ui.warn(f"   couldn't run the critic ({_e})")
                             stage_responses = [_json.dumps(validated, ensure_ascii=False)]
 
                 # This stage feeds a renderer, so "it answered" isn't enough —
@@ -8664,6 +9051,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 # there.
                 if stage_idx == spec_feeder:
                     from . import reel as _reel
+                    from . import length as _length
+                    asked_secs = _length.requested_seconds(query)
                     spec_texts = [t for t in texts if _reel.has_spec(t)] if texts else []
                     if spec_texts:
                         # LAST, not longest: the prompt we typed carries an
@@ -8678,7 +9067,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         # way to catch them is to look, and the only way to fix
                         # them is to say precisely what is wrong.
                         faults = _reel.lint_spec(
-                            _reel.parse_spec(stage_responses[0]))
+                            _reel.parse_spec(stage_responses[0]), requested=asked_secs)
                         if faults:
                             ui.warn(f"the scene spec has {len(faults)} problem(s) "
                                     "— sending them back to be fixed")
@@ -8694,7 +9083,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                 expect='"scenes"')
                             better = [t for t in again if _reel.has_spec(t)]
                             if better:
-                                left = _reel.lint_spec(_reel.parse_spec(better[-1]))
+                                left = _reel.lint_spec(_reel.parse_spec(better[-1]),
+                                                       requested=asked_secs)
                                 # Keep the second attempt only if it is
                                 # genuinely cleaner — a "fix" that trades six
                                 # faults for seven is not a fix.
@@ -8753,14 +9143,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         api_prompt = (
                             (context or "")
                             + "\n\n".join(questions)
-                            + "\n\n" + _reel.spec_instructions()
+                            + "\n\n" + _reel.spec_instructions(requested=asked_secs)
                             + "\n\nReply with ONLY the JSON object — first "
                               "character '{', last '}'.")
                         try:
                             from . import router as _router
                             groq_got = _router.groq_chat(
                                 cfg.get("api_key", ""), cfg.get("model", ""),
-                                api_prompt, json_mode=True, timeout=90)
+                                api_prompt, json_mode=True, timeout=90,
+                                role="writer", addon="reel", feature="spec_fallback")
                             if _reel.has_spec(groq_got):
                                 stage_responses = [groq_got]
                                 ui.ok("   ✓  Groq produced a valid scene spec")
