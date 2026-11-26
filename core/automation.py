@@ -6897,8 +6897,16 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         skip_signal=None, skip_stages: list | None = None,
         min_wait: int = 0, image_stages=None, fallback_signal=None,
         motion_skeleton: str = "", stage_skills: dict | None = None,
-        followup: bool = False, prior_responses: dict | None = None):
+        followup: bool = False, prior_responses: dict | None = None,
+        reuse_stages: list | None = None):
     """Execute the pipeline. Returns (responses, links).
+
+    reuse_stages: stage labels whose answer is already in `prior_responses`
+                 (and, for the artwork stage, whose pictures are already in
+                 `pipeline_files_out`). Those stages are not asked again --
+                 no AI call, no charge -- so a failed reel can be finished
+                 from its saved script and pictures. A label with nothing in
+                 `prior_responses` runs as usual.
 
     stage_skills: {stage label: [skill key]} for a caller that built its own
                  stages -- an add-on naming the doctrine its own prompt was
@@ -7900,6 +7908,23 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                       kit=film_kit, has_logo=motion_has_logo)
             if rebuilt:
                 questions = [rebuilt]
+
+        if (stage in (reuse_stages or ())
+                and any(str(t).strip() for t in all_responses.get(stage, []))):
+            # Finishing a failed run: this step's answer (and pictures) were
+            # made before. Nothing is asked again and nothing is charged.
+            ui.info(f"   ♻️   {stage}: reusing what was already made — "
+                    "nothing is asked again")
+            if stage == "artwork":
+                delivered["image"] = delivered.get("image", 0) + sum(
+                    1 for f in pipeline_files if str(f.get("path", "")).lower()
+                    .endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")))
+            emit("stage_start", {"stage": stage, "agent": agent_name})
+            emit("stage_done", {"stage": stage, "count": 0,
+                                "texts": list(all_responses[stage]),
+                                "url": all_links.get(stage, ""),
+                                "timed_out": False})
+            continue
 
         agent_cfg = A.resolve_agent(stage, agent_name)
         if not agent_cfg:
