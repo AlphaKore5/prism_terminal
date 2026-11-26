@@ -25,11 +25,16 @@ MORAL = re.compile(r"and that is why\b|which is why we\b|the lesson\b|"
                    r"teaches us\b|reminds us\b", re.IGNORECASE)
 SPEECH = re.compile(r"[\"“][^\"“”]{8,}[\"”]|\bsaid\b|\btold\b|\basked\b",
                     re.IGNORECASE)
-# Something a reader could in principle check.
+# Something a reader could in principle check. A year is not the tail of a
+# resolution ('1080x1920'); '%' is followed by a space, not a word boundary;
+# a plan's own numbers (seconds, px, bpm, fps, frames, 16:00) are checkable.
 SPECIFIC = re.compile(
-    r"\b\d[\d,]*(?:\.\d+)?\s*(?:%|kg|tonnes?|tons?|mm|cm|km|m|hours?|hrs?|"
-    r"days?|weeks?|months?|years?|crore|lakh|units?|pieces?|nos\.?)\b|"
-    r"(?:₹|\$|€|£|\bRs\.?)\s?[\d,]+|\b(?:19|20)\d{2}\b|"
+    r"\b\d[\d,]*(?:\.\d+)?\s*(?:kg|tonnes?|tons?|mm|cm|km|m|hours?|hrs?|"
+    r"days?|weeks?|months?|years?|crore|lakh|units?|pieces?|nos\.?|"
+    r"seconds?|secs?|s|ms|px|bpm|fps|frames?)\b|"
+    r"\b\d[\d,]*(?:\.\d+)?\s*%(?!\w)|\b\d{1,2}:\d{2}\b|"
+    r"(?:₹|\$|€|£|\bRs\.?)\s?[\d,]+|"
+    r"(?<![x×\d])(?<![x×] )\b(?:19|20)\d{2}\b(?!\s*[x×]\s*\d)|"
     r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}\b|"
     r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|"
     r"\b\d{1,2}\s*(?:am|pm)\b", re.IGNORECASE)

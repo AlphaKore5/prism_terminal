@@ -9359,6 +9359,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 faults = SK.check(skill_keys, stage_responses[-1],
                                   {"stage": stage, "query": query,
                                    "prompt": skill_task_text})
+                if faults and SK.repair_cannot_help(
+                        faults, stage_responses[-1], skill_task_text, query):
+                    ui.info("   the story has few figures, but the brief says "
+                            "to invent nothing, so it is not sent back")
+                    faults = []
                 if faults:
                     ui.warn(f"   the answer misses {len(faults)} point(s) of "
                             f"the {', '.join(skill_keys)} skill — sending "
