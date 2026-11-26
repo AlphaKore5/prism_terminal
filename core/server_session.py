@@ -156,6 +156,7 @@ class ServerSession:
         self.captures: list[str] = []
         self.pending: list[dict] = []
         self.last_error = ""
+        self.last_error_code = ""       # the AiError code behind last_error
 
     def add_files(self, attachments) -> int:
         """Pictures and PDFs travel with the first prompt. Other files are
@@ -177,16 +178,25 @@ class ServerSession:
         brief can leave a reasoning model no room for the answer itself."""
         from . import ai_client
         full = self._prompt(prompt)
+        self.last_error_code = ""
         try:
-            text = ai_client.chat(
-                self.role, full, addon=self.addon,
-                feature=self.feature, attachments=self.pending or None)
+            try:
+                text = ai_client.chat(
+                    self.role, full, addon=self.addon,
+                    feature=self.feature, attachments=self.pending or None)
+            except ai_client.AiError as e:
+                # Never ask again for an answer the server already charged for
+                # (26 Nov 2026: 255.378 credits taken twice for two empty
+                # answers). Only a call that cost nothing is retried.
+                if (e.code != "EMPTY" or self.role not in _RETRY_ON_EMPTY
+                        or e.detail.get("charged_mc")):
+                    raise
+                text = ai_client.chat(
+                    self.role, full, addon=self.addon, feature=self.feature,
+                    attachments=self.pending or None, model=_RETRY_MODEL)
         except ai_client.AiError as e:
-            if e.code != "EMPTY" or self.role not in _RETRY_ON_EMPTY:
-                raise
-            text = ai_client.chat(
-                self.role, full, addon=self.addon, feature=self.feature,
-                attachments=self.pending or None, model=_RETRY_MODEL)
+            self.last_error_code = e.code or "AI_ERROR"
+            raise
         self.pending = []
         self.turns.append(("USER", prompt))
         self.turns.append(("ASSISTANT", text))

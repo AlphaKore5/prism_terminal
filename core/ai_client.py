@@ -313,6 +313,18 @@ def chat(role: str, prompt: str, *, addon: str = "core", feature: str = "",
     if usage_sink is not None:
         usage_sink.setdefault("cost", 0)
     if not text:
+        charged = int(data.get("charged_mc") or 0)
+        if charged > 0:
+            # The server only answers 200 with no text when the model ran out
+            # of room (finish "length"), and it bills that call.
+            raise AiError(
+                "EMPTY",
+                "The AI used up its whole answer budget and sent back no text. "
+                f"This call was charged {charged / 1000:.1f} credits. Prism has "
+                "not asked again, so nothing more was spent -- try a shorter "
+                "request.",
+                {"charged_mc": charged, "balance_mc": data.get("balance_mc"),
+                 "finish": data.get("finish") or ""})
         raise AiError("EMPTY", "The AI sent back an empty answer. Nothing was "
                                "charged -- please try again.")
     return text

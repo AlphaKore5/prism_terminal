@@ -816,6 +816,23 @@ def check(keys, text: str, context: dict | None = None) -> list:
     return faults
 
 
+_SPECIFICS_FAULT = re.compile(r"Only \d+ checkable specific")
+_NO_INVENTION = re.compile(
+    r"awaiting brand copy|none supplied|(?:do|will|must|never) not invent|"
+    r"nothing (?:is )?invented|to supply\]", re.IGNORECASE)
+
+
+def repair_cannot_help(faults, *texts) -> bool:
+    """True when the only fault is "too few checkable specifics" and the
+    answer or the brief says nothing may be invented ("none supplied", "do not
+    invent", "awaiting brand copy"). Such a repair cannot be satisfied: the
+    writer is told to add facts the brief forbids it to make up, so it is not
+    paid for (26 Nov 2026: a reel plan full of real numbers, no brand copy)."""
+    faults = list(faults or [])
+    return bool(faults) and all(_SPECIFICS_FAULT.search(f) for f in faults) \
+        and any(_NO_INVENTION.search(t or "") for t in texts)
+
+
 def repair_prompt(faults) -> str:
     listed = "\n".join(f"{n}. {f}" for n, f in enumerate(list(faults)[:10], 1))
     return (
