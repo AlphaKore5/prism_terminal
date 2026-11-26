@@ -294,7 +294,8 @@ def build_single_prompt(query: str, context: str, cfg: dict,
     follow-up) already established. `skill_text`: house doctrine for a
     specific kind of post (see _single_brief_prompt's own docstring).
     Returns "" on any failure — the caller falls back to the raw request
-    rather than guessing further."""
+    rather than guessing further — except an ai_client.AiError, which is
+    raised so the caller can show the server's own reason."""
     api_key = (cfg.get("openrouter_api_key") or "").strip()
     if not api_key:
         return ""
@@ -304,6 +305,10 @@ def build_single_prompt(query: str, context: str, cfg: dict,
             _single_brief_prompt(query, context, skill_text),
             temperature=0.5, timeout=60,
             role="writer", addon="image", feature="brief")
+    except _ai.AiError:
+        # A refusal from Prism's server (out of credits, AI paused, rate
+        # limit, timeout) is not "no key": let the caller say what it was.
+        raise
     except Exception:                                         # noqa: BLE001
         return ""
     return (text or "").strip()
@@ -346,7 +351,12 @@ def generate(query: str, prior_text, cfg: dict, attachments=None, *,
     base = (query or "").strip() or _prompt_from(prior_text)
     if not base:
         return "", "Nothing was written for FLUX 3 Klein to draw from."
-    prompt = build_single_prompt(base, context, cfg, skill_text) or base
+    try:
+        prompt = build_single_prompt(base, context, cfg, skill_text) or base
+    except _ai.AiError as e:
+        # Out of credits / AI paused / rate-limited: say so, rather than
+        # quietly drawing from the raw words and hiding the cause.
+        return "", str(e)
     logo_path = _own_logo(attachments)
     if logo_path:
         prompt += (" Do not draw any logo, wordmark, brand mark, or "
@@ -457,6 +467,8 @@ def build_prompts(query: str, context: str, cfg: dict, *, n: int = 6,
             _brief_meta_prompt(query, context, n, has_own_artwork, film),
             temperature=0.5, timeout=60,
             role="writer", addon="image", feature="briefs")
+    except _ai.AiError:
+        raise       # the server's own reason, shown by generate_artwork
     except Exception:                                         # noqa: BLE001
         return []
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
@@ -479,11 +491,16 @@ def generate_artwork(query: str, prior_text, cfg: dict, *,
     style = (_film_style(look, brand) or "Picture style: natural, considered.") if film else ""
     if film:
         n = len(_FILM_ROLES)
-    prompts = build_prompts(query, context, cfg, n=n,
-                            has_own_artwork=has_own_artwork, film=style)
+    try:
+        prompts = build_prompts(query, context, cfg, n=n,
+                                has_own_artwork=has_own_artwork, film=style)
+    except _ai.AiError as e:
+        return [], str(e)
     if not prompts:
-        return [], ("FLUX 3 Klein needs an OpenRouter key to write the "
-                    "image briefs — add one in Settings → AI tools.")
+        if not _ai.active() and not (cfg.get("openrouter_api_key") or "").strip():
+            return [], ("FLUX 3 Klein needs an OpenRouter key to write the "
+                        "image briefs — add one in Settings → AI tools.")
+        return [], f"{_maker()} did not write any image briefs. Try again."
     api_key = (cfg.get("openrouter_api_key") or "").strip()
 
     from . import assets as _assets
