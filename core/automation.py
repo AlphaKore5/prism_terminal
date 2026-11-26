@@ -6062,6 +6062,26 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
             # no markup" from the one candidate that was close (19 Nov 2026).
             if why_bad is None or "No JSON found" in str(why_bad):
                 why_bad = e
+    if (spec is None and design is not None and design.get("refused")
+            and not design.get("stopped")):
+        # Out of credits for the design step: the script and the pictures are
+        # already made and the renderer needs no AI, so film a simple version
+        # rather than nothing (reel_lite). No AI call is made here.
+        try:
+            from . import reel_lite as _lite
+            shown = [a for a in (attachments or []) if isinstance(a, dict)
+                     and str(a.get("path", "")).lower().endswith(
+                         (".png", ".jpg", ".jpeg", ".webp", ".bmp"))]
+            made = [a for a in shown if a.get("_generated")] or shown
+            spec = _lite.build_lite_spec(
+                sources, [a["path"] for a in made], brand)
+        except Exception as e:                              # noqa: BLE001
+            spec = None
+            ui.warn(f"   couldn't make the simpler version ({e})")
+        if spec is not None:
+            ui.warn("   Not enough AI credits for the full design step, so "
+                    "Prism made a simpler version from your script and "
+                    "pictures. It cost nothing extra.")
     if spec is None:
         # Keep what actually came back. Without this the one piece of evidence
         # that could explain the failure is discarded at the moment it becomes
@@ -6138,7 +6158,7 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
     # Rebuilt, not passed along: collect() names assets from the files in a
     # fixed order, so the table the design stage was shown and the table the
     # renderer resolves are the same one without either holding a reference.
-    if attachments:
+    if attachments and not spec.get("_lite"):
         try:
             from . import assets as _assets
             made = {a["path"] for a in attachments if a.get("_generated")}
@@ -6203,7 +6223,11 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
             return "", f"Render failed: {retry_err}"
     for fault in (spec.get("_faults") or [])[:5]:
         ui.warn(f"   layout: {fault}")
-    return out, f"reel filmed — {os.path.basename(out)}"
+    note = f"reel filmed — {os.path.basename(out)}"
+    if spec.get("_lite"):
+        note += (". Simple version, no art direction. Top up your credits "
+                 "and Prism can redesign it.")
+    return out, note
 
 
 def _run_motion(prior_text, attachments, cfg: dict, brand: dict | None = None):
