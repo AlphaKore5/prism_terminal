@@ -6898,8 +6898,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         min_wait: int = 0, image_stages=None, fallback_signal=None,
         motion_skeleton: str = "", stage_skills: dict | None = None,
         followup: bool = False, prior_responses: dict | None = None,
-        reuse_stages: list | None = None):
+        reuse_stages: list | None = None, lite: bool = False):
     """Execute the pipeline. Returns (responses, links).
+
+    lite: a Studio reel without the paid art-direction step. The script and the
+                 pictures are made as usual; the design step is never asked and
+                 the renderer films the simple version (core.reel_lite) from
+                 them. The caller offers this to someone whose balance is under
+                 the reel's estimate; it is never chosen silently.
 
     reuse_stages: stage labels whose answer is already in `prior_responses`
                  (and, for the artwork stage, whose pictures are already in
@@ -7924,6 +7930,16 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                 "texts": list(all_responses[stage]),
                                 "url": all_links.get(stage, ""),
                                 "timed_out": False})
+            continue
+
+        if lite and stage_idx == design_feeder:
+            ui.info("   simpler version: the art-direction step is left out, "
+                    "nothing is asked for it")
+            ai_refused.add(stage)       # the renderer then films reel_lite
+            emit("stage_skipped", {
+                "stage": stage, "agent": agent_name,
+                "reason": "Simpler version: this step is left out to fit "
+                          "your credits."})
             continue
 
         agent_cfg = A.resolve_agent(stage, agent_name)
