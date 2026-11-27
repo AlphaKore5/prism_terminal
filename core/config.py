@@ -96,6 +96,9 @@ DEFAULT = {
     # asks the person where their STEP work should live and stores it here;
     # the terminal sets it with /step-folder. See core.stepfile.output_dir.
     "step_out_dir": "",
+    # Switches for what a Reel costs on Prism's server, all on unless set to
+    # false here. Keys and meaning: core.server_session.SAVINGS.
+    "ai_savings": {},
 }
 
 
