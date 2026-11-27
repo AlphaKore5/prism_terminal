@@ -1337,9 +1337,11 @@ def estimate_run(routing: dict, agents: dict) -> dict:
     if not ai_client.active():
         return {}
     wanted: dict[tuple, int] = {}                 # (role, images) -> calls
+    design_calls = 0                              # art-direction calls of a reel
     for stage, name in planned_steps(routing, agents):
         cfg = A.resolve_agent(stage, name) or {}
         if cfg.get("local") and stage == "media":
+            design_calls += _RENDERER_CALLS["code"]
             for role, n in _RENDERER_CALLS.items():
                 wanted[(role, 0)] = wanted.get((role, 0), 0) + n
             wanted[("image", 1)] = wanted.get(("image", 1), 0) + _RENDERER_IMAGES
@@ -1349,7 +1351,7 @@ def estimate_run(routing: dict, agents: dict) -> dict:
         else:
             key = (SS.role_for(stage, name), 0)
             wanted[key] = wanted.get(key, 0) + 1
-    typical = top = calls = 0
+    typical = top = calls = saved = 0
     try:
         for (role, images), n in wanted.items():
             got = ai_client.estimate(role, approx_in_chars=6000, images=images,
@@ -1357,9 +1359,14 @@ def estimate_run(routing: dict, agents: dict) -> dict:
             typical += int(got.get("typical_mc") or 0) * n
             top += int(got.get("max_mc") or 0) * n
             calls += n
+            if (role, images) == ("code", 0):
+                saved = int(got.get("typical_mc") or 0) * min(n, design_calls)
     except Exception:                                    # noqa: BLE001
         return {}
-    return {"typical_mc": typical, "max_mc": top, "calls": calls}
+    out = {"typical_mc": typical, "max_mc": top, "calls": calls}
+    if design_calls and saved:
+        out["simple_mc"] = max(0, typical - saved)
+    return out
 
 
 def plan_changed(planned: list, confirmed: list) -> bool:
