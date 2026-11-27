@@ -10,6 +10,7 @@ from Google Drive. Selenium/uc are imported lazily so the REPL and dry-runs work
 even on machines where they aren't installed yet.
 """
 from __future__ import annotations
+import functools
 import os
 import re
 import time
@@ -6888,6 +6889,40 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
     return out, f"reel rendered — {os.path.basename(out)}"
 
 
+def _with_quality(fn):
+    """Wrap run(): every AI
+    answer's quality meta (model, level_used, stepped_down, bar_pct) reaches
+    `on_event` as a "quality" event when it changes, and the run ends with one
+    "quality_summary" event and one plain line."""
+    @functools.wraps(fn)
+    def run(routing, cfg, attachments=None, on_event=None, *args, **kwargs):
+        seen: list[dict] = []
+        last: list = [None]
+
+        def heard(meta: dict):
+            seen.append(meta)
+            key = (meta.get("level_used"), meta.get("model"),
+                   meta.get("stepped_down"))
+            if key != last[0]:
+                last[0] = key
+                if on_event:
+                    on_event("quality", dict(meta))
+
+        _ai.set_meta_hook(heard)
+        try:
+            out = fn(routing, cfg, attachments, on_event, *args, **kwargs)
+        finally:
+            _ai.set_meta_hook(None)
+        summary = _ai.summarise_quality(seen)
+        if summary:
+            ui.info("   " + _ai.quality_line(summary))
+            if on_event:
+                on_event("quality_summary", summary)
+        return out
+    return run
+
+
+@_with_quality
 def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         query: str = "", chatgpt_analysis: bool = True,
         custom_stages: list[tuple[str, str, list[str]]] | None = None,
@@ -6904,8 +6939,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     lite: a Studio reel without the paid art-direction step. The script and the
                  pictures are made as usual; the design step is never asked and
                  the renderer films the simple version (core.reel_lite) from
-                 them. The caller offers this to someone whose balance is under
-                 the reel's estimate; it is never chosen silently.
+                 them. The person chooses it: in the up-front offer when their
+                 balance is under the reel's estimate, or on purpose as their
+                 reel style in Settings. It is never chosen silently.
+                 (A reel from the person's OWN pictures, with none made, is
+                 skip_stages=["visual"] with the pictures attached.)
 
     reuse_stages: stage labels whose answer is already in `prior_responses`
                  (and, for the artwork stage, whose pictures are already in
