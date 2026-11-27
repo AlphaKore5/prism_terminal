@@ -64,5 +64,7 @@ saving shrinks (escalated costs cheap + Sonnet).
 - The numeric-grounding check rejects any number in the text that is not a
   measured figure or part of a change. That is strict on purpose; it can
   raise the escalation rate. Tune on real logs. It applies to the Sonnet
-  pick too: an answer that fails is withheld after being billed. Numbers from
-  earlier answers in the chat are allowed.
+  pick too. A strong-model answer that fails was billed, so it is shown under
+  a "Could not be verified" warning with no change offered (a reply with no
+  readable words gets a plain message instead). Numbers from earlier verified
+  answers in the chat are allowed.

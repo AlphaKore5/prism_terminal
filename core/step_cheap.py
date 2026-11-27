@@ -17,9 +17,9 @@ The order, for one question about one measured file (`ask()`):
               diameter, and every number in the text against the report.
   3. ESCALATE Only when validation fails: one call on role `reasoner`
               (Sonnet), told which checks failed, validated the same way.
-              Never a second escalation. If that also fails, the unsafe
-              parts (edits, unverifiable advice) are dropped and the result
-              says so; an honest empty plan beats an invented edit.
+              Never a second escalation. If that also fails, its answer is
+              shown under a "could not be verified" warning and no change is
+              offered; an honest empty plan beats an invented edit.
   Sonnet pick: step 2 is skipped; one validated call on the strong model.
 
 A picture the person agreed to send goes with every AI call. A follow-up
@@ -74,6 +74,13 @@ UNVERIFIED_MESSAGE = (
     "Prism could not verify an AI answer against the measurements of this "
     "file, so it is not shown and no change is proposed. Sizes, hole counts "
     "and part names can still be asked directly.")
+# Goes above a strong-model answer that failed the checks: it was billed, so
+# it is shown. UNVERIFIED_MESSAGE is for when there is no answer to show.
+UNVERIFIED_WARNING = (
+    "Could not be verified: this answer did not pass Prism's checks against "
+    "the measurements of this file. Check every figure before using it. No "
+    "change is proposed.")
+WARNING_MARK = "\u26a0 "           # starts every such answer
 
 CAP_MESSAGE_DAY = ("You have reached today's limit of AI-assisted STEP files. "
                    "Measurements, sizes, hole counts and simple edits still "
@@ -639,7 +646,8 @@ def validate(report: dict, reply: dict, history=None) -> list[str]:
         errs += _check_change(report, ch if isinstance(ch, dict) else {})
     pool = _known_numbers(report)
     for h in history or []:
-        pool.update(_numbers(str(h.get("a", ""))))
+        if not str(h.get("a", "")).startswith(WARNING_MARK):
+            pool.update(_numbers(str(h.get("a", ""))))
     for ch in reply.get("changes") or []:
         if isinstance(ch, dict):
             for k in ("dia_mm", "new_dia_mm", "factor"):
@@ -672,7 +680,7 @@ def _default_client() -> Callable:
 
 
 def _call(client, role: str, prompt: str, model: str = "",
-          attachments: list | None = None) -> tuple[dict | None, float]:
+          attachments: list | None = None) -> tuple[dict | None, float, str]:
     sink: dict = {}
     extra: dict = {}
     if model:
@@ -682,7 +690,18 @@ def _call(client, role: str, prompt: str, model: str = "",
     text = client(role, prompt, addon="step", feature="step.ask",
                   json_mode=True, temperature=0.0, max_tokens=1500,
                   usage_sink=sink, timeout=90, **extra)
-    return parse_reply(text), sink.get("credits_mc", 0) / 1000.0
+    return parse_reply(text), sink.get("credits_mc", 0) / 1000.0, text
+
+
+def _shown_answer(reply: dict | None, raw: str) -> str:
+    """The words of a reply that failed the checks, "" when it has none a
+    person could read (nothing, or broken JSON)."""
+    if reply:
+        lines = [reply["answer"].strip()] + [
+            f"- {a}" for a in _plan_of(reply)["advice"]]
+        return "\n".join(x for x in lines if x).strip()
+    raw = (raw or "").strip()
+    return "" if raw.startswith(("{", "[", "```")) else raw
 
 
 def ask(report: dict, question: str, *, licence_id: str = "", client=None,
@@ -725,7 +744,7 @@ def ask(report: dict, question: str, *, licence_id: str = "", client=None,
         (strong_role, MODEL_STRONG if model else "", PATH_ESCALATED)]
     credits, calls, failures, first = 0.0, 0, [], []
     for role, use, path in steps:
-        reply, c = _call(client, role, fast_prompt(
+        reply, c, raw = _call(client, role, fast_prompt(
             report, question, failures, earlier, bool(attachments)),
             use, attachments)
         credits, calls = credits + c, calls + 1
@@ -736,8 +755,13 @@ def ask(report: dict, question: str, *, licence_id: str = "", client=None,
             return done(reply["answer"], _plan_of(reply), path, credits, calls,
                         failures=first)
         first = first or failures
-    # Nothing checked out: keep nothing the checks could not confirm.
+    # Nothing checked out. The strong model's answer was paid for, so it is
+    # shown under a warning; its changes are never offered for building.
     count_file(licence_id, key, base=base, now=now)
-    return done(UNVERIFIED_MESSAGE, {"changes": [], "advice": []},
-                PATH_UNVERIFIED, credits, calls, verified=False,
-                failures=failures)
+    answer = _shown_answer(reply, raw)
+    text = (f"{WARNING_MARK}{UNVERIFIED_WARNING}\n\n{answer}" if answer
+            else UNVERIFIED_MESSAGE)
+    result = done(text, {"changes": [], "advice": []}, PATH_UNVERIFIED,
+                  credits, calls, verified=False, failures=failures)
+    result["answer"] = answer
+    return result

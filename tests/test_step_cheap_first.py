@@ -412,3 +412,35 @@ def test_a_number_from_an_earlier_answer_may_be_repeated(report, base):
             history=[_turn("size?", "Try 7 mm.")])
     assert r["path"] == sc.PATH_CHEAP
     assert sc.validate(report, reply)                        # not without it
+
+
+# ── a billed strong answer that fails the checks is shown, with a warning ──
+
+@pytest.mark.parametrize("model,replies", [
+    ("", 2), (sc.MODEL_FAST, 2), (sc.MODEL_STRONG, 1)])
+def test_a_failed_strong_answer_is_shown_under_a_warning(report, base, model,
+                                                         replies):
+    r = ask(report, base, AI_Q, Full(*[_lie()] * replies), model=model)
+    assert r["path"] == sc.PATH_UNVERIFIED and not r["verified"]
+    assert r["text"].startswith(sc.WARNING_MARK + sc.UNVERIFIED_WARNING)
+    assert GOOD["answer"] in r["text"] and "Keep Ø8 as is." in r["text"]
+    assert GOOD["answer"] in r["answer"]
+    assert r["plan"] == {"changes": [], "advice": []}      # nothing to build
+
+
+def test_prose_from_the_strong_model_is_shown_too(report, base):
+    r = ask(report, base, AI_Q, Full("Make the plate 77 mm."),
+            model=sc.MODEL_STRONG)
+    assert sc.UNVERIFIED_WARNING in r["text"] and "77 mm" in r["text"]
+
+
+@pytest.mark.parametrize("raw", ["", '{"changes": [', '{"claims": []}'])
+def test_no_readable_answer_gives_the_plain_message(report, base, raw):
+    r = ask(report, base, AI_Q, Full(raw), model=sc.MODEL_STRONG)
+    assert r["text"] == sc.UNVERIFIED_MESSAGE and r["answer"] == ""
+
+
+def test_numbers_from_an_unverified_answer_are_not_trusted_later(report):
+    reply = {"answer": "Yes, 77 mm.", "claims": [], "changes": [], "advice": []}
+    bad = sc.WARNING_MARK + sc.UNVERIFIED_WARNING + " Make it 77 mm."
+    assert sc.validate(report, reply, [_turn("size?", bad)])
