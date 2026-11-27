@@ -37,7 +37,7 @@ _DEFAULT_ROLE = "writer"
 # Dropped on purpose (the owner's call); a plan that still names one keeps the
 # step on screen, marked as left out, instead of opening a browser.
 _NO_SERVER_EQUIVALENT = frozenset({
-    "Canva", "Midjourney", "Runway", "HeyGen", "ElevenLabs", "Suno",
+    "Canva", "Midjourney", "Runway", "HeyGen", "ElevenLabs", "Sarvam", "Suno",
     "NotebookLM", "Gamma.app", "Tome", "Claude Design", "Google Flow",
     "InVideo AI", "Pika Labs", "Apollo",
 })

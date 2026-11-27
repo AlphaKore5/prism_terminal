@@ -141,7 +141,7 @@ CATEGORIES = {
         "emoji": "🔊",
         "color": "audio",
         "desc": "Voice-over, narration, music & audio explainers",
-        "agents": ["ElevenLabs", "Suno", "NotebookLM"],
+        "agents": ["ElevenLabs", "Sarvam", "Suno", "NotebookLM"],
     },
     "development": {
         "label": "Web, App & Tools",
@@ -164,8 +164,18 @@ def prune_for_server() -> None:
     """Server mode: stop offering tools and categories Prism's plan does not
     include (Canva, Midjourney, voice, decks, ...). Only the pickable lists
     change; AGENT_REGISTRY and PIPELINE_ORDER stay, so an old saved plan that
-    still names one is skipped at run time with a plain message. Idempotent."""
+    still names one is skipped at run time with a plain message. Idempotent.
+
+    Where default work runs in the browser (core.default_work), its steps
+    offer that module's short lists instead, slides and voice included."""
     from .server_session import _NO_SERVER_EQUIVALENT, _NO_SERVER_STAGES
+    from . import default_work as DW
+    if DW.enabled():
+        for stage, meta in CATEGORIES.items():
+            meta["agents"] = (
+                list(DW.CHOICES[stage]) if stage in DW.CHOICES else
+                [n for n in meta["agents"] if n not in _NO_SERVER_EQUIVALENT])
+        return
     for stage in _NO_SERVER_STAGES:
         CATEGORIES.pop(stage, None)
     for meta in CATEGORIES.values():
@@ -188,11 +198,15 @@ def server_effective(agents: dict | None) -> dict:
     (ChatGPT, Runway, ...) or whether it names anything. The other writing
     stages get the first tool of their category when none is set. Nothing is
     written back to the config."""
-    from . import ai_client
+    from . import ai_client, default_work as DW
     out = {k: v for k, v in (agents or {}).items() if v}
     if not ai_client.active():
         return out
-    for stage in _SERVER_FILLED:
+    filled = _SERVER_FILLED
+    if DW.enabled():
+        out = DW.picks(out)
+        filled += DW.FILLED
+    for stage in filled:
         cat = CATEGORIES.get(stage)
         if not cat:
             continue
@@ -248,6 +262,7 @@ _MAKES = {
     "InVideo AI": "a finished promo video cut from the uploaded footage",
     "HeyGen": "an AI-avatar video",
     "ElevenLabs": "a voice-over audio file",
+    "Sarvam": "a voice-over audio file",
     "Suno": "a music track",
     "omma.build": "a working, deployed app",
     "emergent.sh": "a working, deployed app",
@@ -496,6 +511,7 @@ _PROFILES: dict[str, dict] = {
     "InVideo AI": {"produces": ("video",), "file_hint": "", "avoid": ""},
     "HeyGen": {"produces": ("video",), "file_hint": "", "avoid": ""},
     "ElevenLabs": {"produces": ("file",), "file_hint": "", "avoid": ""},
+    "Sarvam": {"produces": ("file",), "file_hint": "", "avoid": ""},
     "Suno": {"produces": ("file",), "file_hint": "", "avoid": ""},
     "NotebookLM": {"produces": ("text", "file", "video"), "file_hint": "",
                    "avoid": ""},
@@ -1056,6 +1072,18 @@ AGENT_REGISTRY = {
         textarea_selector=("textarea, [contenteditable='true'][role='textbox'], "
                            "[contenteditable='true']"),
     ),
+    # Same speech form as ElevenLabs, so the same runner (the "elevenlabs"
+    # runner name means "speech form": it is sent the spoken words only).
+    "Sarvam": _agent(
+        "https://dashboard.sarvam.ai/text-to-speech",
+        "natural text-to-speech in Indian languages",
+        "Freemium", "5–15s", 45,
+        runner="elevenlabs",
+        page_wait=8,
+        input_wait=40,
+        textarea_selector=("textarea, [contenteditable='true'][role='textbox'], "
+                           "[contenteditable='true']"),
+    ),
     # Runs INSIDE Prism — no browser, no account, no upload. Marked local so
     # automation.py renders it here instead of driving a Chrome tab.
     "Prism Studio": _agent(
@@ -1238,8 +1266,8 @@ def alternatives_for(stage: str, tried: list | tuple = (),
     request this signal exists to keep away from Canva in the first
     place.
     """
-    from . import ai_client
-    if ai_client.active():
+    from . import ai_client, default_work as DW
+    if ai_client.active() and not (DW.in_browser_run() and stage in DW.STAGES):
         # Server mode has no other websites to hand a failed step to; a
         # retry here would only spend the customer's credits again.
         return []

@@ -23,6 +23,7 @@ from . import config as C
 from . import ui
 from . import ai_client as _ai
 from . import server_session as _SS
+from . import default_work as _DW
 
 def _server_aware(neutral):
     """In server mode `driver` is a ServerSession, not a browser. A helper that
@@ -139,7 +140,7 @@ def _get_driver(cfg: dict):
     """Return (driver, fresh) — reusing the still-open browser from a
     previous run when possible, so results left on screen aren't disturbed."""
     global _active_driver
-    if _ai.active():
+    if _ai.active() and not _DW.in_browser_run():
         # Server mode: every AI step is a call to Prism's server. Reaching
         # this line is a bug in the caller, and a loud one beats a Chrome
         # window opening on a customer's desktop.
@@ -6497,8 +6498,9 @@ def _voiceover_text(prior_text) -> str:
 
 
 def _run_elevenlabs(driver, agent_cfg: dict, narration: str,
-                    should_stop=None) -> list[str]:
-    """Drive ElevenLabs' speech form, which is not a chat composer."""
+                    should_stop=None, tool: str = "ElevenLabs") -> list[str]:
+    """Drive a voice tool's speech form (ElevenLabs, Sarvam), which is not a
+    chat composer."""
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support.ui import WebDriverWait
@@ -6508,7 +6510,7 @@ def _run_elevenlabs(driver, agent_cfg: dict, narration: str,
     if not narration:
         raise RuntimeError(
             "the writing step supplied no spoken voice-over lines, so Prism "
-            "did not send pipeline instructions to ElevenLabs")
+            f"did not send pipeline instructions to {tool}")
 
     box = WebDriverWait(driver, agent_cfg.get("input_wait", 20)).until(
         EC.presence_of_element_located(
@@ -6531,7 +6533,7 @@ def _run_elevenlabs(driver, agent_cfg: dict, narration: str,
         pass
 
     if not _text_landed(_composer_text(driver, box), narration):
-        raise RuntimeError("the narration would not go into ElevenLabs' text field")
+        raise RuntimeError(f"the narration would not go into {tool}'s text field")
 
     signature_js = """
         const audio = [...document.querySelectorAll('audio')]
@@ -6605,7 +6607,7 @@ def _run_elevenlabs(driver, agent_cfg: dict, narration: str,
 
     if generate is None:
         raise RuntimeError(
-            "Prism could not find ElevenLabs' Generate speech button; its "
+            f"Prism could not find {tool}'s Generate speech button; its "
             "page layout may have changed")
 
     try:
@@ -6626,7 +6628,7 @@ def _run_elevenlabs(driver, agent_cfg: dict, narration: str,
         except Exception:
             continue
     raise RuntimeError(
-        "ElevenLabs accepted the narration, but no new audio player or "
+        f"{tool} accepted the narration, but no new audio player or "
         "download appeared before the wait ended")
 
 
@@ -6815,6 +6817,20 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
     return out, f"reel rendered — {os.path.basename(out)}"
 
 
+def _default_work_scope(fn):
+    """Mark the thread for the length of a default-work run, so the helpers
+    that choose between the browser and Prism's server can tell. Any other
+    run, nested ones included, is marked as not one."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        with _DW.running(bool(k.get("default_work")) and _DW.enabled()):
+            return fn(*a, **k)
+    return wrapper
+
+
+@_default_work_scope
 def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         query: str = "", chatgpt_analysis: bool = True,
         custom_stages: list[tuple[str, str, list[str]]] | None = None,
@@ -6824,8 +6840,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         skip_signal=None, skip_stages: list | None = None,
         min_wait: int = 0, image_stages=None, fallback_signal=None,
         motion_skeleton: str = "", stage_skills: dict | None = None,
-        followup: bool = False, prior_responses: dict | None = None):
+        followup: bool = False, prior_responses: dict | None = None,
+        default_work: bool = False):
     """Execute the pipeline. Returns (responses, links).
+
+    default_work: this is the person's own task ("Prism default work"). Where
+                 the host offers it (core.default_work.enabled), its research,
+                 thinking, writing, building, slide and voice steps are worked
+                 in the person's browser; pictures and video stay on Prism's
+                 server. Add-ons never pass it.
 
     stage_skills: {stage label: [skill key]} for a caller that built its own
                  stages -- an add-on naming the doctrine its own prompt was
@@ -6937,18 +6960,30 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         if on_event:
             on_event(kind, payload)
 
+    browser_work = _DW.in_browser_run()
     agents = A.server_effective(cfg.get("agents"))
     stages = list(custom_stages) if custom_stages is not None else list(_needed_stages(routing, agents))
     if not stages:
         ui.warn("Router marked every stage as not-needed — nothing to run.")
         return {}, {}
 
+    if browser_work:
+        # An older plan or a saved task can name a tool that is no longer
+        # offered for a step. The step's default stands in, out loud.
+        for _i, (_st, _an, _qs) in enumerate(stages):
+            _use = _DW.pick(_st, _an)
+            if _use != _an:
+                ui.info(f"   {_an} isn't offered for this step any more — "
+                        f"using {_use}")
+                stages[_i] = (_st, _use, _qs)
+    file_reader = _DW.file_reader(cfg) if browser_work else "ChatGPT"
+
     # ChatGPT is Prism's dedicated file analyst: whenever attachments ride
     # along, it reads them FIRST and hands a precise brief to the pipeline —
     # its file/vision handling is the most reliable of the web tools. If this
     # stage fails, `prior` stays empty and the next stage gets the raw files
     # re-supplied, so the run degrades gracefully to the old behaviour.
-    if browser_attachments and chatgpt_analysis and not followup and stages[0][1] != "ChatGPT":
+    if browser_attachments and chatgpt_analysis and not followup and stages[0][1] != file_reader:
         names = ", ".join(a["name"] for a in browser_attachments)
         goal = f" for this task: {query}" if query.strip() else " for the user's task"
         q = (f"Your ONLY task is: analyse the attached file(s) ({names}) thoroughly — "
@@ -6957,8 +6992,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
              f"use these files{goal}. Do NOT perform the task itself. Do not "
              "reproduce the file's rows or text back; where a profile of a "
              "spreadsheet is given below, trust its counts over your own.")
-        stages.insert(0, ("analysis", "ChatGPT", [q]))
-        ui.info("📎  attachments present — ChatGPT will analyse the files first")
+        stages.insert(0, ("analysis", file_reader, [q]))
+        ui.info(f"📎  attachments present — {file_reader} will analyse the files first")
 
     # The script writer needs to know what each source shot actually shows,
     # but uploading hundreds of megabytes of client MOVs to every browser tool
@@ -7397,7 +7432,17 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         C.continue_run(cur_dir, task=query, title=run_title)
     else:
         C.begin_run(query, title=run_title)
-    if _ai.active():
+    # In a default-work run each step has its own place: `server_driver` for
+    # pictures and video, `browser_driver` for the rest, opened only when the
+    # first browser step is reached (a picture-only task never opens Chrome).
+    server_driver = browser_driver = None
+    video_scripts: set = set()
+    server_stages: set = set()          # steps that ran on the server
+    if browser_work:
+        server_driver = _SS.ServerSession()
+        video_scripts = _DW.video_script_steps(stages)
+        driver, fresh = server_driver, False
+    elif _ai.active():
         # Server mode: no Chrome, ever. Every AI step is a call through
         # Prism's server (core/server_session.py).
         driver, fresh = _SS.ServerSession(), True
@@ -7460,7 +7505,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         Prism — no tab, no upload, no scrape. Consumes the earlier stages'
         text and files, produces a real file here, and reports like any
         other stage. Shared by the main loop and the deferred pass."""
-        emit("stage_start", {"stage": stage, "agent": agent_name})
+        emit("stage_start", {"stage": stage, "agent": agent_name,
+                             **({"on": "server"} if browser_work else {})})
         ui.rule(f"{stage.upper()}  ·  {agent_name}",
                 style=A.CATEGORIES.get(stage, {}).get("color", "pink"))
         # Newest stage first, each kept separate: the spec comes from the
@@ -7829,6 +7875,26 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                           "it in the plan."})
             continue
 
+        if browser_work and not agent_cfg.get("local"):
+            if _DW.step_in_browser(stage, agent_name,
+                                   video_script=stage_idx in video_scripts):
+                if browser_driver is None:
+                    try:
+                        browser_driver, first_tab = _get_driver(cfg)
+                    except Exception as e:                  # noqa: BLE001
+                        reason = ("Prism couldn't open Chrome for this step: "
+                                  f"{e}")
+                        ui.err(f"   {reason}")
+                        emit("stage_start", {"stage": stage, "agent": agent_name,
+                                             "on": "browser"})
+                        emit("stage_error", {"stage": stage, "error": reason,
+                                             "url": ""})
+                        continue
+                driver = browser_driver
+            else:
+                driver = server_driver
+                server_stages.add(stage)
+
         if _SS.is_session(driver):
             # Server mode. A picture-only site becomes Prism's own picture
             # step; a tool with no server equivalent is shown as left out.
@@ -7894,7 +7960,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             _run_local_stage(stage, agent_name, agent_cfg)
             continue
 
-        emit("stage_start", {"stage": stage, "agent": agent_name})
+        emit("stage_start", {
+            "stage": stage, "agent": agent_name,
+            **({"on": "server" if _SS.is_session(driver) else "browser"}
+               if browser_work else {})})
         ui.rule(f"{stage.upper()}  ·  {agent_name}", style=A.CATEGORIES.get(stage, {}).get("color", "pink"))
 
         timed_out = False
@@ -7903,6 +7972,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # recovers once if Chrome's visible window lost its controlled tab
             # before any prompt/upload could be duplicated.
             _open_agent_page(agent_name, agent_cfg, stage)
+            if browser_work and not _SS.is_session(driver):
+                browser_driver = driver         # it may have been relaunched
 
             # Only NON-EMPTY prior outputs count — a failed scrape must not
             # inject an empty "[STAGE]" block downstream.
@@ -8189,7 +8260,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     narration = _voiceover_text(questions)
                 ui.info(f"   → narration only: {len(narration.split())} words")
                 stage_responses = _run_elevenlabs(
-                    driver, agent_cfg, narration, should_stop=stage_halt)
+                    driver, agent_cfg, narration, should_stop=stage_halt,
+                    tool=agent_name)
             elif agent_name == "NotebookLM":
                 # NotebookLM is not a chat box — it's a "sources" notebook.
                 # It is handed the earlier steps' FULL answers and the
@@ -8504,6 +8576,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                 "retrying the prompt once")
                             try:
                                 _open_agent_page(agent_name, agent_cfg, stage)
+                                if browser_work:
+                                    browser_driver = driver
                                 _submit_prompt(
                                     driver, agent_cfg, agent_name, full_prompt,
                                     has_attachments=bool(attachments or send_files))
@@ -9455,9 +9529,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 + ", ".join(f"{s} ({i['agent']})" for s, i in incomplete.items()))
         emit("run_incomplete", {"stages": incomplete})
 
-    if failover and failures and not stopped():
+    # A step that ran on the server (a picture, a video's script) is never
+    # handed to a website to try again.
+    retryable = {s: i for s, i in failures.items() if s not in server_stages}
+    if failover and retryable and not stopped():
         _retry_failed_stages(
-            failures, cfg, all_responses, all_links,
+            retryable, cfg, all_responses, all_links,
             attachments=attachments, query=query, emit=emit,
             should_stop=should_stop, stages=stages,
             pipeline_files=pipeline_files, brand=studio_brand,
@@ -9620,7 +9697,8 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
                     # is having a bad afternoon retries itself forever.
                     failover=False,
                     pipeline_files_out=recovered_files,
-                    image_stages=image_stages)
+                    image_stages=image_stages,
+                    **({"default_work": True} if _DW.in_browser_run() else {}))
             except Exception as e:                       # noqa: BLE001
                 ui.err(f"   {alternative} also failed: {e}")
                 continue

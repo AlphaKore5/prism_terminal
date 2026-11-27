@@ -1333,11 +1333,15 @@ def estimate_run(routing: dict, agents: dict) -> dict:
     """{"typical_mc", "max_mc", "calls"} for the plan as it stands, from the
     server's estimate route (never charges). {} when AI is not on the server
     or the server cannot say; the plan is shown without a number then."""
-    from . import ai_client, server_session as SS
+    from . import ai_client, server_session as SS, default_work as DW
     if not ai_client.active():
         return {}
     wanted: dict[tuple, int] = {}                 # (role, images) -> calls
-    for stage, name in planned_steps(routing, agents):
+    steps = planned_steps(routing, agents)
+    where = DW.places(steps) if DW.enabled() else ["server"] * len(steps)
+    for (stage, name), place in zip(steps, where):
+        if place == "browser":
+            continue                    # the person's own account: no credits
         cfg = A.resolve_agent(stage, name) or {}
         if cfg.get("local") and stage == "media":
             for role, n in _RENDERER_CALLS.items():
