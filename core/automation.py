@@ -10,6 +10,7 @@ from Google Drive. Selenium/uc are imported lazily so the REPL and dry-runs work
 even on machines where they aren't installed yet.
 """
 from __future__ import annotations
+import functools
 import os
 import re
 import time
@@ -5740,6 +5741,28 @@ def _adopt_assets(spec: dict, files, generated=None) -> str:
     return _assets.manifest(fresh)
 
 
+def _tell_session(ask, driver) -> None:
+    """Let the Reel flow tell a server conversation what each of its turns is
+    (core.server_session.aim_turn). A browser tab is told nothing."""
+    if _SS.is_session(driver):
+        ask.aim, ask.look = driver.aim, driver.look
+        ask.resend = driver.savings["resend_failed_scene"]
+
+
+def _as_reel(fn):
+    """Every AI call inside belongs to a Reel (core.ai_client.set_film)."""
+    @functools.wraps(fn)
+    def inside(*args, **kwargs):
+        before = _ai.film_state()
+        _ai.set_film("reel")
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _ai.restore_film(before)
+    return inside
+
+
+@_as_reel
 def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
                     change: str, attachments=None, on_event=None,
                     on_progress=None, images: str = "",
@@ -5906,11 +5929,12 @@ def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
             style=A.CATEGORIES.get("design", {}).get("color", "pink"))
     if driver is None:
         if _ai.active():
-            driver = _SS.ServerSession()
+            driver = _SS.ServerSession(cfg=cfg)
         else:
             driver, _ = _get_driver(cfg)
     if _SS.is_session(driver):
         driver.begin("design", agent_name, "code")
+        driver.turn_kind = "followup"
     else:
         _open_tab(driver, agent_name)
         driver.get(design_url)
@@ -5932,10 +5956,14 @@ def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
         got = _reask(driver, agent_cfg, prompt, expect=expect, wait=wait)
         return got[-1] if got else ""
 
+    _tell_session(ask, driver)
     new_spec, notes = _web.refine_spec(
         spec, change, ask, check=_web.inspect,
         log=lambda m: ui.info(f"   {m}"), new_assets=listing,
-        context=context)
+        context=context,
+        # A server conversation starts empty: there is no design chat that
+        # remembers the scenes, so the code goes with the change.
+        with_code=_SS.is_session(driver))
     try:
         url = driver.current_url or design_url
     except Exception:                                    # noqa: BLE001
@@ -6064,9 +6092,10 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
                 why_bad = e
     if (spec is None and design is not None and design.get("refused")
             and not design.get("stopped")):
-        # Out of credits for the design step: the script and the pictures are
-        # already made and the renderer needs no AI, so film a simple version
-        # rather than nothing (reel_lite). No AI call is made here.
+        # The design step's AI call failed (no credits, a provider error, no
+        # connection) or was left out: the script and the pictures are already
+        # made and the renderer needs no AI, so film a simple version rather
+        # than nothing (reel_lite). No AI call is made here.
         try:
             from . import reel_lite as _lite
             shown = [a for a in (attachments or []) if isinstance(a, dict)
@@ -6079,9 +6108,13 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
             spec = None
             ui.warn(f"   couldn't make the simpler version ({e})")
         if spec is not None:
-            ui.warn("   Not enough AI credits for the full design step, so "
-                    "Prism made a simpler version from your script and "
-                    "pictures. It cost nothing extra.")
+            # The real reason, in the server's own words: a provider error
+            # was once shown as "not enough credits" (27 Nov 2026).
+            err = str(design.get("error") or "").strip()
+            ui.warn("   The full design step did not run"
+                    + (f": {err.rstrip('.')}." if err else ".")
+                    + " Prism made a simpler version from your script and "
+                      "pictures. It cost nothing extra.")
     if spec is None:
         # Keep what actually came back. Without this the one piece of evidence
         # that could explain the failure is discarded at the moment it becomes
@@ -6888,6 +6921,42 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
     return out, f"reel rendered — {os.path.basename(out)}"
 
 
+def _with_quality(fn):
+    """Wrap run(): every AI
+    answer's quality meta (model, level_used, stepped_down, bar_pct) reaches
+    `on_event` as a "quality" event when it changes, and the run ends with one
+    "quality_summary" event and one plain line."""
+    @functools.wraps(fn)
+    def run(routing, cfg, attachments=None, on_event=None, *args, **kwargs):
+        seen: list[dict] = []
+        last: list = [None]
+
+        def heard(meta: dict):
+            seen.append(meta)
+            key = (meta.get("level_used"), meta.get("model"),
+                   meta.get("stepped_down"))
+            if key != last[0]:
+                last[0] = key
+                if on_event:
+                    on_event("quality", dict(meta))
+
+        _ai.set_meta_hook(heard)
+        film_before = _ai.film_state()
+        try:
+            out = fn(routing, cfg, attachments, on_event, *args, **kwargs)
+        finally:
+            _ai.set_meta_hook(None)
+            _ai.restore_film(film_before)
+        summary = _ai.summarise_quality(seen)
+        if summary:
+            ui.info("   " + _ai.quality_line(summary))
+            if on_event:
+                on_event("quality_summary", summary)
+        return out
+    return run
+
+
+@_with_quality
 def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         query: str = "", chatgpt_analysis: bool = True,
         custom_stages: list[tuple[str, str, list[str]]] | None = None,
@@ -6898,14 +6967,23 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         min_wait: int = 0, image_stages=None, fallback_signal=None,
         motion_skeleton: str = "", stage_skills: dict | None = None,
         followup: bool = False, prior_responses: dict | None = None,
-        reuse_stages: list | None = None, lite: bool = False):
+        reuse_stages: list | None = None, lite: bool = False, film: str = ""):
     """Execute the pipeline. Returns (responses, links).
+
+    film: "reel" or "motion" when this run is part of a film but its own stages
+                 do not show it (a script written ahead of the design, a change
+                 to one scene). A run with a film renderer or design stage in it
+                 works this out itself. Every AI call of such a run is tagged
+                 with it (core.ai_client.set_film).
 
     lite: a Studio reel without the paid art-direction step. The script and the
                  pictures are made as usual; the design step is never asked and
                  the renderer films the simple version (core.reel_lite) from
-                 them. The caller offers this to someone whose balance is under
-                 the reel's estimate; it is never chosen silently.
+                 them. The person chooses it: in the up-front offer when their
+                 balance is under the reel's estimate, or on purpose as their
+                 reel style in Settings. It is never chosen silently.
+                 (A reel from the person's OWN pictures, with none made, is
+                 skip_stages=["visual"] with the pictures attached.)
 
     reuse_stages: stage labels whose answer is already in `prior_responses`
                  (and, for the artwork stage, whose pictures are already in
@@ -7484,10 +7562,18 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         C.continue_run(cur_dir, task=query, title=run_title)
     else:
         C.begin_run(query, title=run_title)
+    if not film:
+        renderers = {(A.resolve_agent("", an) or {}).get("local")
+                     for _, an, _ in stages}
+        if design_feeder is not None or renderers & {"reel", "reel_web"}:
+            film = "reel"
+        elif motion_feeder is not None or "motion" in renderers:
+            film = "motion"
+    _ai.set_film(film)
     if _ai.active():
         # Server mode: no Chrome, ever. Every AI step is a call through
         # Prism's server (core/server_session.py).
-        driver, fresh = _SS.ServerSession(), True
+        driver, fresh = _SS.ServerSession(cfg=cfg), True
     else:
         driver, fresh = _get_driver(cfg)
     all_responses: dict[str, list[str]] = {
@@ -7588,8 +7674,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 ui.err(note)
                 emit("stage_error", {"stage": stage, "error": note, "url": ""})
                 return
-            made = [{"path": p, "kind": "image", "name": os.path.basename(p)}
-                    for p in paths]
+            # `_generated` like every harvested picture: the renderer names the
+            # pictures again from these marks, and without it its names differ
+            # from the ones the design step was given.
+            made = [{"path": p, "kind": "image", "name": os.path.basename(p),
+                     "_generated": True} for p in paths]
             audio_in_pipeline = [
                 f for f in pipeline_files
                 if f.get("kind") == "audio" or str(f.get("path", "")).lower()
@@ -7795,6 +7884,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             driver.begin(stage, agent_name, _SS.role_for(
                 stage, agent_name,
                 feeder=(stage_idx in (design_feeder, motion_feeder, spec_feeder))))
+            driver.cache_head = stage_idx in (design_feeder, motion_feeder)
+            if _ai.current_film() == "reel":
+                if stage_idx == design_feeder:
+                    driver.turn_kind = "design"
+                elif stage_idx == spec_feeder or stage in ("content", "script"):
+                    driver.turn_kind = "script"
             return
         target = agent_cfg["url"]
         res_cand = (resume_urls or {}).get(stage)
@@ -9015,6 +9110,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                      wait=scene_wait)
                         return got[-1] if got else ""
 
+                    _tell_session(_ask, driver)
                     script_txt = "\n".join(all_responses.get(script_stage) or [])
                     try:
                         first_reply = _design_turn_text(driver, agent_cfg, texts,

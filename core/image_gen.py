@@ -24,6 +24,7 @@ import os
 import time
 
 from . import ai_client as _ai
+from . import files as _files
 from . import openrouter as _openrouter
 
 # OpenRouter's own id for the model (confirmed live against
@@ -153,6 +154,11 @@ def _own_logo(attachments) -> str:
     return ""
 
 
+def _ext(data: bytes) -> str:
+    """The file ending for the picture the model actually sent (often JPEG)."""
+    return _files.IMAGE_EXTS.get(_files.image_mime(data), ".png")
+
+
 def _composite_logo(image_path: str, logo_path: str) -> str:
     """Paste the client's REAL logo onto the generated picture — never ask
     FLUX to draw one. core.assets' own docstring says why: "A model asked
@@ -170,8 +176,11 @@ def _composite_logo(image_path: str, logo_path: str) -> str:
         pos = (base.width - logo.width - margin,
               base.height - logo.height - margin)
         base.alpha_composite(logo, dest=pos)
-        base.convert("RGB").save(image_path, "PNG")
-    return image_path
+        out = os.path.splitext(image_path)[0] + ".png"
+        base.convert("RGB").save(out, "PNG")
+    if out != image_path:
+        os.remove(image_path)
+    return out
 
 
 def _single_brief_prompt(query: str, context: str, skill_text: str = "") -> str:
@@ -287,6 +296,15 @@ def _maker() -> str:
     return "Prism AI" if ai_client.active() else "FLUX 3 Klein"
 
 
+def _reel_turn(cfg: dict, kind: str) -> dict:
+    """A Reel's picture briefs on Prism's server get the turn's output limit
+    and effort. Any other picture is asked exactly as before."""
+    if not (_ai.active() and _ai.current_film() == "reel"):
+        return {}
+    from . import server_session as _ss
+    return _ss.turn_options(_ss.savings_of(cfg), kind)
+
+
 def build_single_prompt(query: str, context: str, cfg: dict,
                         skill_text: str = "") -> str:
     """ONE complete FLUX prompt, written by Claude Haiku 5.5 from the
@@ -304,7 +322,8 @@ def build_single_prompt(query: str, context: str, cfg: dict,
             api_key, BRIEF_MODEL,
             _single_brief_prompt(query, context, skill_text),
             temperature=0.5, timeout=60,
-            role="writer", addon="image", feature="brief")
+            role="writer", addon="image", feature="brief",
+            **_reel_turn(cfg, "brief"))
     except _ai.AiError:
         # A refusal from Prism's server (out of credits, AI paused, rate
         # limit, timeout) is not "no key": let the caller say what it was.
@@ -372,7 +391,7 @@ def generate(query: str, prior_text, cfg: dict, attachments=None, *,
 
     from . import config as _config
     os.makedirs(_config.RUNS_DIR, exist_ok=True)
-    out = os.path.join(_config.RUNS_DIR, f"flux_{int(time.time())}.png")
+    out = os.path.join(_config.RUNS_DIR, f"flux_{int(time.time())}{_ext(data)}")
     with open(out, "wb") as f:
         f.write(data)
     # The actual prompt, not just a filename — a later follow-up's own
@@ -382,7 +401,7 @@ def generate(query: str, prior_text, cfg: dict, attachments=None, *,
     note = f"{_maker()} drew: {prompt[:280]}"
     if logo_path:
         try:
-            _composite_logo(out, logo_path)
+            out = _composite_logo(out, logo_path)
             note += " (your own logo placed on top)"
         except Exception as e:                               # noqa: BLE001
             note += f" (could not place your logo on it: {e})"
@@ -466,7 +485,8 @@ def build_prompts(query: str, context: str, cfg: dict, *, n: int = 6,
             api_key, BRIEF_MODEL,
             _brief_meta_prompt(query, context, n, has_own_artwork, film),
             temperature=0.5, timeout=60,
-            role="writer", addon="image", feature="briefs")
+            role="writer", addon="image", feature="briefs",
+            **_reel_turn(cfg, "briefs"))
     except _ai.AiError:
         raise       # the server's own reason, shown by generate_artwork
     except Exception:                                         # noqa: BLE001
@@ -525,7 +545,7 @@ def generate_artwork(query: str, prior_text, cfg: dict, *,
                 why = str(e)
             continue
         raw = os.path.join(_config.RUNS_DIR,
-                           f"flux_{int(time.time())}_{i}.png")
+                           f"flux_{int(time.time())}_{i}{_ext(data)}")
         with open(raw, "wb") as f:
             f.write(data)
         # A scene plate is kept whole; only a cut-out subject has its ground removed.
