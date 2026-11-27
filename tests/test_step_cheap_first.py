@@ -243,3 +243,172 @@ def test_every_answer_is_logged_by_path(report, base):
     assert s["local"]["avg"] == 0
     assert s["cheap"]["avg"] == 2.0 and s["escalated"]["avg"] == 42.0
     assert "licence" in open(os.path.join(base, "step_ai_log.jsonl")).readline()
+
+
+# ── model pick and picture ──────────────────────────────────────────────────
+
+AI_Q = "how could this be easier to assemble"
+PIC = [{"kind": "image", "mime": "image/png", "b64": "x", "name": "s.png"}]
+
+
+class Full(Fake):
+    """Also keeps what each call carried."""
+    def __init__(self, *replies):
+        super().__init__(*replies)
+        self.sent = []
+
+    def __call__(self, role, prompt, **kw):
+        self.sent.append({"role": role, "prompt": prompt,
+                          "model": kw.get("model", ""),
+                          "attachments": kw.get("attachments")})
+        return super().__call__(role, prompt, **kw)
+
+
+def _lie():
+    return _bad(claims=[{"type": "hole_count", "part": "PLATE", "value": 9}])
+
+
+def test_haiku_pick_is_the_cheap_path_with_one_escalation_to_sonnet(report, base):
+    fake = Full(_lie(), GOOD)
+    r = ask(report, base, AI_Q, fake, model=sc.MODEL_FAST, attachments=PIC)
+    assert r["path"] == sc.PATH_ESCALATED
+    assert [(s["role"], s["model"]) for s in fake.sent] == [
+        (sc.ROLE_FAST, sc.MODEL_FAST), (sc.ROLE_PICTURE, sc.MODEL_STRONG)]
+    assert [s["attachments"] for s in fake.sent] == [PIC, PIC]
+    assert "drawing of these parts" in fake.sent[0]["prompt"]
+
+
+def test_sonnet_pick_goes_straight_to_sonnet_once(report, base):
+    fake = Full(GOOD)
+    r = ask(report, base, AI_Q, fake, model=sc.MODEL_STRONG)
+    assert r["path"] == sc.PATH_STRONG and r["verified"]
+    assert [(s["role"], s["model"], s["attachments"]) for s in fake.sent] == [
+        (sc.ROLE_ESCALATE, sc.MODEL_STRONG, None)]
+    assert "drawing of these parts" not in fake.sent[0]["prompt"]
+
+
+def test_sonnet_pick_with_a_picture_and_a_failed_check_is_not_retried(report, base):
+    fake = Full(_lie(), GOOD)
+    r = ask(report, base, AI_Q, fake, model=sc.MODEL_STRONG, attachments=PIC)
+    assert r["path"] == sc.PATH_UNVERIFIED and len(fake.sent) == 1
+    assert fake.sent[0]["role"] == sc.ROLE_PICTURE
+
+
+@pytest.mark.parametrize("model", ["", sc.MODEL_FAST, sc.MODEL_STRONG])
+def test_local_answers_stay_free_with_a_picture_and_any_pick(report, base, model):
+    fake = Full()
+    r = ask(report, base, "how many holes are there", fake, model=model,
+            attachments=PIC)
+    assert r["path"] == sc.PATH_LOCAL and fake.sent == []
+    assert sc._load_usage(base) == {}
+    assert sc.answers_locally(report, "how many holes are there")
+    assert not sc.answers_locally(report, AI_Q)
+
+
+@pytest.mark.parametrize("model", [sc.MODEL_FAST, sc.MODEL_STRONG])
+def test_both_picks_count_against_the_cap(report, base, monkeypatch, model):
+    monkeypatch.setattr(sc, "STEP_AI_FILES_PER_DAY", 1)
+    ask(report, base, AI_Q, Full(GOOD), model=model)
+    fake = Full(GOOD)
+    r = ask(_distinct(report, 1), base, AI_Q, fake, model=model, attachments=PIC)
+    assert r["capped"] and fake.sent == []
+
+
+# ── a failed call does not count ────────────────────────────────────────────
+
+def _boom(*a, **kw):
+    raise RuntimeError("server down")
+
+
+@pytest.mark.parametrize("model", ["", sc.MODEL_STRONG])
+def test_a_failed_call_does_not_count(report, base, monkeypatch, model):
+    monkeypatch.setattr(sc, "STEP_AI_FILES_PER_DAY", 1)
+    for _ in range(3):
+        with pytest.raises(RuntimeError):
+            ask(report, base, AI_Q, _boom, model=model)
+    assert sc._load_usage(base) == {}
+    # the one file of the day is still there to be used
+    assert ask(_distinct(report, 1), base, AI_Q, Full(GOOD))["verified"]
+
+
+def test_a_failed_escalation_does_not_count_either(report, base):
+    fake = Fake(_lie())
+
+    def client(role, prompt, **kw):
+        if role != sc.ROLE_FAST:
+            raise RuntimeError("server down")
+        return fake(role, prompt, **kw)
+
+    with pytest.raises(RuntimeError):
+        ask(report, base, AI_Q, client)
+    assert sc._load_usage(base) == {}
+
+
+def test_an_answered_but_unverified_question_counts(report, base):
+    ask(report, base, AI_Q, Fake(_lie(), _lie()))
+    assert sc._load_usage(base) != {}
+
+
+# ── follow-ups ──────────────────────────────────────────────────────────────
+
+def _turn(q, a):
+    return {"q": q, "a": a}
+
+
+FILLER = [_turn(f"general question number {i}",
+                "Nothing particular to report. " * 30) for i in range(10)]
+
+
+def test_and_the_other_hole_goes_to_ai_with_the_earlier_answer(report, base):
+    history = [_turn("which hole should grow", "Enlarge H2 from Ø5 to Ø6 mm.")]
+    fake = Full(GOOD)
+    r = ask(report, base, "and the other hole?", fake, history=history)
+    assert r["path"] == sc.PATH_CHEAP
+    assert "Enlarge H2 from Ø5 to Ø6 mm." in fake.sent[0]["prompt"]
+    assert "The customer asks: and the other hole?" in fake.sent[0]["prompt"]
+
+
+def test_a_pointing_question_is_not_guessed_locally(report, base):
+    q = "what size is that other hole"
+    assert sc.answers_locally(report, q)                     # on its own
+    assert not sc.answers_locally(report, q, [_turn("x", "y")])
+    # a named hole, or a plain fact, stays free in a follow-up
+    for q in ("what size is H1", "how many holes are there"):
+        assert sc.answers_locally(report, q, [_turn("x", "y")])
+
+
+def test_recent_turns_are_trimmed_newest_kept(report):
+    block = sc.history_block(FILLER, "is it light enough")
+    assert "number 9" in block and "number 0" not in block
+    assert len(block) <= sc.HISTORY_CHARS + 200
+
+
+def test_a_reference_several_turns_back_brings_that_turn(report):
+    history = [_turn("what about the bracket slot", "SLOTMARKER stays as is."),
+               ] + FILLER
+    assert "SLOTMARKER" not in sc.history_block(history, "is it light enough")
+    block = sc.history_block(
+        history, "go back to what you said about the bracket slot")
+    assert "SLOTMARKER" in block and "number 9" in block
+    assert "left out" in block
+    assert len(block) <= sc.HISTORY_CHARS + sc.HISTORY_OLDER_CHARS + 200
+
+
+def test_an_older_hole_tag_brings_its_turn_without_pointing_words(report):
+    history = [_turn("tell me about H3", "H3MARKER is near the edge.")] + FILLER
+    assert "H3MARKER" in sc.history_block(history, "enlarge H3 a bit, is it fine")
+
+
+def test_the_very_first_answer_can_be_asked_for(report):
+    history = [_turn("opening", "FIRSTMARKER")] + FILLER
+    assert "FIRSTMARKER" in sc.history_block(history, "what did you say first")
+
+
+def test_a_number_from_an_earlier_answer_may_be_repeated(report, base):
+    reply = {"answer": "Yes, the 7 mm size suggested before still works.",
+             "claims": [], "changes": [], "advice": []}
+    q = "is that still fine"
+    r = ask(report, base, q, Fake(reply),
+            history=[_turn("size?", "Try 7 mm.")])
+    assert r["path"] == sc.PATH_CHEAP
+    assert sc.validate(report, reply)                        # not without it

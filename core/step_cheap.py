@@ -11,8 +11,8 @@ The order, for one question about one measured file (`ask()`):
               fields) or a plain edit ("enlarge H3 to 8 mm") is answered by
               code from the report. No AI call, no credits, not counted
               against the AI-file cap.
-  2. CHEAP    Anything else goes to role `step.fast` once, asked for strict
-              JSON. The answer is then run through local validators that
+  2. CHEAP    Anything else goes to role `step.fast` once (the person's
+              Haiku pick, or no pick), asked for strict JSON. The answer is then run through local validators that
               re-check every claim, every named part, hole tag and
               diameter, and every number in the text against the report.
   3. ESCALATE Only when validation fails: one call on role `reasoner`
@@ -20,13 +20,20 @@ The order, for one question about one measured file (`ask()`):
               Never a second escalation. If that also fails, the unsafe
               parts (edits, unverifiable advice) are dropped and the result
               says so; an honest empty plan beats an invented edit.
+  Sonnet pick: step 2 is skipped; one validated call on the strong model.
+
+A picture the person agreed to send goes with every AI call. A follow-up
+sends the recent earlier exchanges, and older ones when it refers back
+(history_block).
 
 A per-licence daily and monthly cap on AI-assisted FILES (not questions)
-limits the worst case; local-only work is free and never counted. Every
+limits the worst case; local-only work is free and never counted, and nor
+is a call that fails. Every
 answer appends one line to step_ai_log.jsonl (which path ran, how many
 credits) so the saving is measurable.
 
-The STEP file itself is never sent; only the measured text, as before.
+The STEP file itself is never sent; only the measured text (and, with the
+person's consent, Prism's own drawing of the parts), as before.
 """
 from __future__ import annotations
 
@@ -41,6 +48,18 @@ from . import stepfile as SF
 
 ROLE_FAST = "step.fast"
 ROLE_ESCALATE = "reasoner"
+ROLE_PICTURE = "vision"          # the strong call when a picture goes with it
+
+# The person's pick in STEP. Sent with the call, as before; the server checks
+# it against its allow-list. "" (no pick) leaves the choice to the server.
+MODEL_FAST = "anthropic/claude-haiku-5.5"
+MODEL_STRONG = "anthropic/claude-sonnet-5.5"
+
+# Earlier chat sent with a follow-up, in characters (about 4 to a token).
+HISTORY_CHARS = 3000             # the recent exchanges, newest kept first
+HISTORY_OLDER_CHARS = 1500       # extra, only when the question refers back
+HISTORY_ANSWER_CHARS = 600       # one answer is cut to this
+HISTORY_QUESTION_CHARS = 300
 
 # Config constants. The server must enforce the same caps; these stop an
 # honest client early and give the customer a plain message.
@@ -49,6 +68,12 @@ STEP_AI_FILES_PER_DAY = 40
 
 PATH_LOCAL, PATH_CHEAP, PATH_ESCALATED = "local", "cheap", "escalated"
 PATH_UNVERIFIED, PATH_CAPPED = "unverified", "capped"
+PATH_STRONG = "strong"           # the person picked the strong model
+
+UNVERIFIED_MESSAGE = (
+    "Prism could not verify an AI answer against the measurements of this "
+    "file, so it is not shown and no change is proposed. Sizes, hole counts "
+    "and part names can still be asked directly.")
 
 CAP_MESSAGE_DAY = ("You have reached today's limit of AI-assisted STEP files. "
                    "Measurements, sizes, hole counts and simple edits still "
@@ -334,6 +359,104 @@ def local_answer(report: dict, question: str) -> str | None:
     return None
 
 
+# A follow-up that leans on what was said before: code cannot know what "that
+# one" is, so it is not answered locally.
+_POINTS_BACK = re.compile(
+    r"\b(other|another|that|those|these|same|previous(?:ly)?|earlier|"
+    r"you (?:said|suggested|mentioned|proposed)|(?:first|last) one)\b")
+# Wording that asks for older turns than the recent ones.
+_REFERS_BACK = re.compile(
+    r"\b(other|another|that|those|these|same|previous(?:ly)?|earlier|before|"
+    r"again|originally|original|first|at the start|beginning|you (?:said|"
+    r"suggested|mentioned|proposed|told)|we (?:said|discussed|talked)|"
+    r"go back|back to)\b")
+_FIRST = re.compile(r"\b(first|at the start|beginning|original(?:ly)?)\b")
+_PLAIN_WORDS = frozenset(
+    "about again also back before could does earlier first from have hole "
+    "holes just like make mentioned more other part parts previous said same "
+    "should some suggested than that them then there these they this those "
+    "what when where which will with would your".split())
+
+
+def _local(report: dict, question: str, history=None) -> tuple | None:
+    """(text, plan) when code alone answers, else None."""
+    q = question.lower()
+    edit = local_edit(report, question)
+    if edit and edit["changes"] and edit["changes"][0]:
+        c = edit["changes"][0]
+        txt = (f"Planned: " + (f"enlarge {c['hole']} from Ø{c['dia_mm']:g} to "
+               f"Ø{c['new_dia_mm']:g} mm on {c['part']}" if c["op"] ==
+               "enlarge_hole" else f"scale by {c['factor']:g}") + ".")
+        if not _check_change(report, c):
+            return txt, edit
+    if (history and _POINTS_BACK.search(q)
+            and not re.search(r"\bh\d+\b", q)):
+        return None
+    local = local_answer(report, question)
+    if local:
+        return local, {"changes": [], "advice": []}
+    return None
+
+
+def answers_locally(report: dict, question: str, history=None) -> bool:
+    """True when asking this would send nothing and cost nothing."""
+    return _local(report, question, history) is not None
+
+
+# ── earlier chat ─────────────────────────────────────────────────────────────
+
+def _cut(text: str, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def _terms(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9_]+(?:\.\d+)?", text.lower())
+            if (len(w) >= 4 or re.fullmatch(r"[hg]\d+|\d+(?:\.\d+)?", w))
+            and w not in _PLAIN_WORDS}
+
+
+def history_block(history, question: str) -> str:
+    """The earlier exchanges ([{"q", "a"}], oldest first) to send with a
+    follow-up. Recent ones, newest kept first, up to HISTORY_CHARS; when the
+    question refers back (or names a hole only an older turn spoke of), up to
+    HISTORY_OLDER_CHARS more from before that window, best matches first."""
+    turns = [f"Customer: {_cut(h.get('q'), HISTORY_QUESTION_CHARS)}\n"
+             f"Answer: {_cut(h.get('a'), HISTORY_ANSWER_CHARS)}"
+             for h in history or []]
+    if not turns:
+        return ""
+    keep, used, i = set(), 0, len(turns) - 1
+    while i >= 0 and used + len(turns[i]) <= HISTORY_CHARS:
+        keep.add(i)
+        used += len(turns[i])
+        i -= 1
+    older = list(range(i + 1))
+    q = question.lower()
+    tags = set(re.findall(r"\bh\d+\b", q))
+    if older and (_REFERS_BACK.search(q) or any(
+            tags & _terms(turns[j]) for j in older)):
+        want = _terms(q)
+
+        def score(j):
+            n = len(want & _terms(turns[j]))
+            return n + (100 if j == 0 and _FIRST.search(q) else 0)
+
+        used = 0
+        # best match first; with nothing to match, the newest of the older
+        for j in sorted(older, key=lambda j: (score(j), j), reverse=True):
+            if used + len(turns[j]) <= HISTORY_OLDER_CHARS:
+                keep.add(j)
+                used += len(turns[j])
+    out, last = [], -1
+    for j in sorted(keep):
+        if j != last + 1:
+            out.append("(some earlier turns left out)")
+        out.append(turns[j])
+        last = j
+    return "\n".join(out)
+
+
 # ── 2. cheap pass: prompt, parse, validators ─────────────────────────────────
 
 SCHEMA = (
@@ -352,8 +475,8 @@ SCHEMA = (
     ' "advice": [ "..." ]}')
 
 
-def fast_prompt(report: dict, question: str, failures: list[str] | None = None
-                ) -> str:
+def fast_prompt(report: dict, question: str, failures: list[str] | None = None,
+                earlier: str = "", picture: bool = False) -> str:
     o = report["overall_mm"]
     p = (f"You advise a {report['mode']} moulding shop on a customer's part. "
          "The CAD model is confidential; only the offline measurements below "
@@ -369,7 +492,13 @@ def fast_prompt(report: dict, question: str, failures: list[str] | None = None
          f"Job: {report['file']} · assembly overall "
          f"{o[0]:.2f} x {o[1]:.2f} x {o[2]:.2f} mm · "
          f"{len(report['parts'])} part(s)\n{SF._part_lines(report)}\n\n"
-         f"The customer asks: {question}\n")
+         + ("A drawing of these parts, made from the same measurements, is "
+            "attached. Use it to see the layout; take every figure from the "
+            "measurements.\n\n" if picture else "")
+         + ("Earlier in this chat (context for what the customer means; the "
+            f"measurements above are the truth):\n{earlier}\n\n"
+            if earlier else "")
+         + f"The customer asks: {question}\n")
     if failures:
         p += ("\nA first draft was REJECTED by automatic checks against the "
               "measurements:\n- " + "\n- ".join(failures[:8]) +
@@ -449,8 +578,10 @@ def _check_change(report: dict, ch: dict) -> list[str]:
     return errs
 
 
-def validate(report: dict, reply: dict) -> list[str]:
-    """Every reason NOT to trust the reply; [] means it checks out."""
+def validate(report: dict, reply: dict, history=None) -> list[str]:
+    """Every reason NOT to trust the reply; [] means it checks out. Numbers
+    already given in earlier answers (`history`) may be repeated; claims and
+    changes are still checked against the measurements only."""
     errs: list[str] = []
     holes = hole_table(report)
     for c in reply.get("claims") or []:
@@ -507,6 +638,8 @@ def validate(report: dict, reply: dict) -> list[str]:
     for ch in reply.get("changes") or []:
         errs += _check_change(report, ch if isinstance(ch, dict) else {})
     pool = _known_numbers(report)
+    for h in history or []:
+        pool.update(_numbers(str(h.get("a", ""))))
     for ch in reply.get("changes") or []:
         if isinstance(ch, dict):
             for k in ("dia_mm", "new_dia_mm", "factor"):
@@ -538,19 +671,35 @@ def _default_client() -> Callable:
     return ai_client.chat
 
 
-def _call(client, role: str, prompt: str) -> tuple[dict | None, float]:
+def _call(client, role: str, prompt: str, model: str = "",
+          attachments: list | None = None) -> tuple[dict | None, float]:
     sink: dict = {}
+    extra: dict = {}
+    if model:
+        extra["model"] = model
+    if attachments:
+        extra["attachments"] = attachments
     text = client(role, prompt, addon="step", feature="step.ask",
                   json_mode=True, temperature=0.0, max_tokens=1500,
-                  usage_sink=sink, timeout=90)
+                  usage_sink=sink, timeout=90, **extra)
     return parse_reply(text), sink.get("credits_mc", 0) / 1000.0
 
 
 def ask(report: dict, question: str, *, licence_id: str = "", client=None,
-        base: str = "", now=None) -> dict:
+        base: str = "", now=None, model: str = "",
+        attachments: list | None = None, history: list | None = None) -> dict:
     """Result: {text, plan, path, credits, calls, verified, failures, capped}.
     `client(role, prompt, **kw) -> str` defaults to ai_client.chat; tests
-    pass a fake. `base` is the folder holding the cap and log files."""
+    pass a fake. `base` is the folder holding the cap and log files.
+
+    `model`: the person's pick. MODEL_STRONG goes straight to the strong
+    model, once. Anything else takes the cheap pass, then one escalation to
+    the strong model only when validation fails. `attachments`: pictures sent
+    with every AI call made here (never for a local answer). `history`:
+    earlier exchanges [{"q", "a"}], oldest first, for a follow-up.
+
+    A file counts against the cap only once an answer comes back: a call
+    that raises leaves the count as it was."""
     def done(text, plan, path, credits=0.0, calls=0, verified=True,
              failures=None):
         _log(base, licence_id, report, path, calls, credits, now)
@@ -558,44 +707,37 @@ def ask(report: dict, question: str, *, licence_id: str = "", client=None,
                 "calls": calls, "verified": verified,
                 "failures": failures or [], "capped": path == PATH_CAPPED}
 
-    edit = local_edit(report, question)
-    if edit and edit["changes"] and edit["changes"][0]:
-        c = edit["changes"][0]
-        txt = (f"Planned: " + (f"enlarge {c['hole']} from Ø{c['dia_mm']:g} to "
-               f"Ø{c['new_dia_mm']:g} mm on {c['part']}" if c["op"] ==
-               "enlarge_hole" else f"scale by {c['factor']:g}") + ".")
-        if not _check_change(report, c):
-            return done(txt, edit, PATH_LOCAL)
-    local = local_answer(report, question)
+    local = _local(report, question, history)
     if local:
-        return done(local, {"changes": [], "advice": []}, PATH_LOCAL)
+        return done(local[0], local[1], PATH_LOCAL)
 
     key = file_key(report)
     msg = cap_status(licence_id, key, base=base, now=now)
     if msg:
         return done(msg, {"changes": [], "advice": []}, PATH_CAPPED)
-    count_file(licence_id, key, base=base, now=now)
 
     client = client or _default_client()
-    credits, calls = 0.0, 0
-    reply, c = _call(client, ROLE_FAST, fast_prompt(report, question))
-    credits, calls = credits + c, calls + 1
-    failures = (validate(report, reply) if reply
-                else ["the reply was not valid JSON in the required shape"])
-    if not failures:
-        return done(reply["answer"], _plan_of(reply), PATH_CHEAP, credits, calls)
-
-    reply2, c = _call(client, ROLE_ESCALATE,
-                      fast_prompt(report, question, failures))
-    credits, calls = credits + c, calls + 1
-    failures2 = (validate(report, reply2) if reply2
-                 else ["the reply was not valid JSON in the required shape"])
-    if not failures2:
-        return done(reply2["answer"], _plan_of(reply2), PATH_ESCALATED,
-                    credits, calls, failures=failures)
-    # Both failed: keep nothing the checks could not confirm.
-    return done("Prism could not verify an AI answer against the measurements "
-                "of this file, so it is not shown and no change is proposed. "
-                "Sizes, hole counts and part names can still be asked "
-                "directly.", {"changes": [], "advice": []}, PATH_UNVERIFIED,
-                credits, calls, verified=False, failures=failures2)
+    earlier = history_block(history, question)
+    strong = model == MODEL_STRONG
+    strong_role = ROLE_PICTURE if attachments else ROLE_ESCALATE
+    steps = [(strong_role, model, PATH_STRONG)] if strong else [
+        (ROLE_FAST, model, PATH_CHEAP),
+        (strong_role, MODEL_STRONG if model else "", PATH_ESCALATED)]
+    credits, calls, failures, first = 0.0, 0, [], []
+    for role, use, path in steps:
+        reply, c = _call(client, role, fast_prompt(
+            report, question, failures, earlier, bool(attachments)),
+            use, attachments)
+        credits, calls = credits + c, calls + 1
+        failures = (validate(report, reply, history) if reply
+                    else ["the reply was not valid JSON in the required shape"])
+        if not failures:
+            count_file(licence_id, key, base=base, now=now)
+            return done(reply["answer"], _plan_of(reply), path, credits, calls,
+                        failures=first)
+        first = first or failures
+    # Nothing checked out: keep nothing the checks could not confirm.
+    count_file(licence_id, key, base=base, now=now)
+    return done(UNVERIFIED_MESSAGE, {"changes": [], "advice": []},
+                PATH_UNVERIFIED, credits, calls, verified=False,
+                failures=failures)
