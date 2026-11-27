@@ -27,6 +27,8 @@ import pathlib
 from io import BytesIO
 from typing import Any
 
+from ..server_session import aim_turn
+
 MODEL = "anthropic/claude-haiku-5.5"
 MAX_FRAMES = 12            # a cap, not a target: one settled frame per scene
 FRAME_WIDTH = 540          # what the model sees; enough to read, cheap to send
@@ -194,6 +196,7 @@ def repair(scenes: list[dict], spec_of, ask, parse, keep, say, look, expect,
     for n in sorted(order):
         idx = n - 1
         lines = "\n".join(f"{k}. {d['type']} — {d['where']}".rstrip(" —") for k, d in enumerate(by[n][:6], 1))
+        aim_turn(ask, "repair", scenes, idx, current=scenes[idx])
         fixed = parse(ask(
             f"A reviewer looked at the finished frame of scene {n} and rejected it:\n\n{lines}\n\n"
             f"Send the corrected scene {n}: ONLY the JSON object, same shape, in a ```json fenced block. "

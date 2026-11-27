@@ -250,6 +250,35 @@ def _run_id() -> str:
     return getattr(_run, "id", "")
 
 
+# A film run (Reel or Motion): every call this thread makes while it lasts is
+# tagged with that add-on name, whatever the caller said (the script, the
+# briefs, the pictures, the design turns), so the server's Reel / Motion shares
+# and its one-Reel-at-a-time rule see the whole job. `feature` is left alone.
+FILMS = ("reel", "motion")
+
+
+def film_state() -> tuple[str, str]:
+    """(film, run id) of this thread, to hand back to restore_film()."""
+    return current_film(), _run_id()
+
+
+def current_film() -> str:
+    return getattr(_run, "film", "")
+
+
+def set_film(kind: str) -> None:
+    """This thread's following calls belong to a "reel" or "motion" run. A run
+    with no run id yet gets one. Anything else changes nothing."""
+    if kind in FILMS:
+        _run.film = kind
+        if not _run_id():
+            set_run_id(kind[0] + uuid.uuid4().hex[:16])
+
+
+def restore_film(state: tuple[str, str]) -> None:
+    _run.film, _run.id = state
+
+
 # ── the wire ─────────────────────────────────────────────────────────────────
 
 _OFFLINE = ("Couldn't reach Prism's server -- check your internet connection "
@@ -373,7 +402,7 @@ def _addon(text: str) -> str:
 
 def _call_fields(role: str, addon: str, feature: str, artifact_ref: str) -> dict:
     out = {"idem_key": uuid.uuid4().hex, "role": role,
-           "addon": _addon(addon),
+           "addon": current_film() or _addon(addon),
            "feature": _ident(feature, role, 40),
            "run_id": _run_id(),
            "artifact_ref": _ident(artifact_ref, "", 64)}
@@ -382,13 +411,32 @@ def _call_fields(role: str, addon: str, feature: str, artifact_ref: str) -> dict
     return out
 
 
+def _cached(content, prefix: str):
+    """`content` with its opening `prefix` as a text part of its own, marked
+    for the provider's prompt cache. The text sent is the same either way."""
+    blocks = ([{"type": "text", "text": content}] if isinstance(content, str)
+              else list(content))
+    text = blocks[0].get("text", "")
+    if not prefix or len(text) <= len(prefix) or not text.startswith(prefix):
+        return content
+    return [{"type": "text", "text": prefix,
+             "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": text[len(prefix):]}] + blocks[1:]
+
+
 def _chat_body(role, prompt, attachments, *, addon, feature, artifact_ref,
-               json_mode, temperature, max_tokens, system) -> dict:
+               json_mode, temperature, max_tokens, system,
+               cache_prefix: str = "", effort: str = "") -> dict:
     msgs = []
     if system:
         msgs.append({"role": "system", "content": system})
-    msgs.append({"role": "user", "content": _content(prompt, attachments)})
+    content = _content(prompt, attachments)
+    if cache_prefix:
+        content = _cached(content, cache_prefix)
+    msgs.append({"role": "user", "content": content})
     body = _call_fields(role, addon, feature, artifact_ref)
+    if effort:
+        body["effort"] = effort      # a request: the server decides if it applies
     body["messages"] = msgs
     if json_mode:
         body["json_mode"] = True
@@ -416,7 +464,8 @@ def chat(role: str, prompt: str, *, addon: str = "core", feature: str = "",
          temperature: float | None = None, max_tokens: int | None = None,
          system: str = "", timeout: int = 180, retries: int = 1,
          usage_out: dict | None = None, usage_sink: dict | None = None,
-         artifact_ref: str = "", model_hint: str = "", model: str = "") -> str:
+         artifact_ref: str = "", model_hint: str = "", model: str = "",
+         cache_prefix: str = "", effort: str = "") -> str:
     """One answer from the server. `model_hint` is accepted for the callers
     that still name a model and is deliberately not sent. `model` is the
     opposite: the person picked it (STEP's Haiku / Sonnet), so it is sent and
@@ -424,10 +473,20 @@ def chat(role: str, prompt: str, *, addon: str = "core", feature: str = "",
     body = _chat_body(role, prompt, attachments, addon=addon,
                       feature=feature or role, artifact_ref=artifact_ref,
                       json_mode=json_mode, temperature=temperature,
-                      max_tokens=max_tokens, system=system)
+                      max_tokens=max_tokens, system=system,
+                      cache_prefix=cache_prefix, effort=effort)
     if model:
         body["model"] = model
-    data = _post(PATH_CHAT, body, bearer=True, timeout=timeout, retries=retries)
+    try:
+        data = _post(PATH_CHAT, body, bearer=True, timeout=timeout, retries=retries)
+    except AiError as e:
+        # The owner can set the server's output limit below ours. Refused
+        # before anything ran: ask once more and let the server's limit stand.
+        if not (max_tokens and e.code == "REQUEST_TOO_LARGE"
+                and e.detail.get("limit") == "max_output_tokens"):
+            raise
+        body.pop("max_tokens", None)
+        data = _post(PATH_CHAT, body, bearer=True, timeout=timeout, retries=retries)
     _heard(data, body)
     text = data.get("text") or ""
     for sink in (usage_out, usage_sink):

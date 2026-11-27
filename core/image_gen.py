@@ -287,6 +287,15 @@ def _maker() -> str:
     return "Prism AI" if ai_client.active() else "FLUX 3 Klein"
 
 
+def _reel_turn(cfg: dict, kind: str) -> dict:
+    """A Reel's picture briefs on Prism's server get the turn's output limit
+    and effort. Any other picture is asked exactly as before."""
+    if not (_ai.active() and _ai.current_film() == "reel"):
+        return {}
+    from . import server_session as _ss
+    return _ss.turn_options(_ss.savings_of(cfg), kind)
+
+
 def build_single_prompt(query: str, context: str, cfg: dict,
                         skill_text: str = "") -> str:
     """ONE complete FLUX prompt, written by Claude Haiku 5.5 from the
@@ -304,7 +313,8 @@ def build_single_prompt(query: str, context: str, cfg: dict,
             api_key, BRIEF_MODEL,
             _single_brief_prompt(query, context, skill_text),
             temperature=0.5, timeout=60,
-            role="writer", addon="image", feature="brief")
+            role="writer", addon="image", feature="brief",
+            **_reel_turn(cfg, "brief"))
     except _ai.AiError:
         # A refusal from Prism's server (out of credits, AI paused, rate
         # limit, timeout) is not "no key": let the caller say what it was.
@@ -466,7 +476,8 @@ def build_prompts(query: str, context: str, cfg: dict, *, n: int = 6,
             api_key, BRIEF_MODEL,
             _brief_meta_prompt(query, context, n, has_own_artwork, film),
             temperature=0.5, timeout=60,
-            role="writer", addon="image", feature="briefs")
+            role="writer", addon="image", feature="briefs",
+            **_reel_turn(cfg, "briefs"))
     except _ai.AiError:
         raise       # the server's own reason, shown by generate_artwork
     except Exception:                                         # noqa: BLE001

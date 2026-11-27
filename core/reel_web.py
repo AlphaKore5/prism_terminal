@@ -36,6 +36,8 @@ import re
 import shutil
 import subprocess
 
+from .server_session import aim_turn
+
 W, H = 1080, 1920
 SAFE_X, SAFE_Y = 90, 130
 DEFAULT_FPS = 30
@@ -1350,6 +1352,7 @@ def _repair_rhythm(scenes: list[dict], design: dict, ask, say, measure, check=No
     for idx in _rhythm.targets(profile, durations, what):
         activity = _rhythm.scene_activity(profile, durations)[idx]
         say(f"rhythm: {profile['static_pct']:.0f}% of frames are still — sending scene {idx + 1} back")
+        aim_turn(ask, "repair", scenes, idx, current=scenes[idx])
         fixed = parse_scene(ask(
             _rhythm.repair_text(idx + 1, what, profile, activity, medium="studio")
             + f"\n\nSend the corrected scene {idx + 1}: ONLY the JSON object, same keys, in a ```json fenced block.",
@@ -2416,6 +2419,12 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
     if len(lines) < total:
         lines = lines + [{}] * (total - len(lines))
 
+    # A server conversation is told the look once; it is all that later turns
+    # need of the art-direction reply.
+    if getattr(ask, "look", None):
+        ask.look(json.dumps({"design": design, "storyboard": board},
+                            ensure_ascii=False))
+
     say(f"storyboard: {total} scene(s) — writing them one at a time")
     scenes: list[dict] = []
     # Set whenever a turn answers more scenes than it was asked for, and
@@ -2434,11 +2443,18 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
         prompt = overflow_notice + scene_instructions(i, total, board[i],
                                                        lines[i], assets)
         overflow_notice = ""
+        aim_turn(ask, "scene", scenes, i)
         raw = ask(prompt, SCENE_EXPECT) or ""
         scene = parse_scene(raw)
-        if scene is None:
+        if scene is None and not raw.strip() and getattr(ask, "resend", False):
+            # The call itself failed, so the conversation never saw the
+            # request: ask for this one scene again, in full.
+            aim_turn(ask, "scene", scenes, i)
+            scene = parse_scene(ask(prompt, SCENE_EXPECT) or "")
+        elif scene is None:
             # One retry, and a blunter ask. Almost always prose where JSON was
             # wanted, which a second, shorter prompt reliably fixes.
+            aim_turn(ask, "repair", scenes, i, last=True)
             scene = parse_scene(ask(
                 f"Send scene {i + 1} again as JSON only — first character "
                 '\'{\', last \'}\', keys "seconds", "cut", "css", "html", '
@@ -2504,6 +2520,7 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
             if faults:
                 say(f"scene {i + 1} has {len(faults)} layout problem(s) — "
                     "sending them back")
+                aim_turn(ask, "repair", scenes, i, current=scene)
                 fixed = parse_scene(ask(
                     f"Scene {i + 1} was laid out at 1080x1920 and these are "
                     "wrong:\n\n"
@@ -2839,10 +2856,15 @@ def refine_spec(spec: dict, change: str, ask, check=None, log=None,
     total = len(spec.get("scenes") or [])
     if not total:
         raise ReelError("There is no reel to change.")
-    raw = ask(followup_instructions(change, spec, new_assets, context),
-              SCENE_EXPECT) or ""
+    first = followup_instructions(change, spec, new_assets, context)
+    aim_turn(ask, "followup")
+    raw = ask(first, SCENE_EXPECT) or ""
     patch = parse_followup(raw, total)
-    if patch is None:
+    if patch is None and not raw.strip() and getattr(ask, "resend", False):
+        aim_turn(ask, "followup")       # the call failed: the same request again
+        patch = parse_followup(ask(first, SCENE_EXPECT) or "", total)
+    elif patch is None:
+        aim_turn(ask, "repair", last=True)
         raw = ask("A storyboard or description cannot be rendered. Send complete "
                   "HTML and CSS for each changed scene. Send the change again "
                   "as JSON only — first character '{', "
@@ -2876,6 +2898,7 @@ def refine_spec(spec: dict, change: str, ask, check=None, log=None,
             continue
         say(f"scene {idx + 1} has {len(faults)} layout problem(s) — sending "
             "them back")
+        aim_turn(ask, "repair", current={"scene": idx + 1, **patch["scenes"][idx]})
         fixed = parse_followup(ask(
             f"Scene {idx + 1} was laid out at 1080x1920 and these are wrong:"
             "\n\n" + "\n".join(f"{n}. {x}" for n, x in enumerate(faults[:8], 1))
