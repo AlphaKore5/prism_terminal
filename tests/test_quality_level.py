@@ -118,4 +118,4 @@ def test_a_full_bar_is_said_plainly_with_the_choices(server):
                                       "detail": {"reason": "bar_full", "offer_topup": True,
                                                  "bar_pct": 100, "week_resets_at": 1796083200}}})
     assert e.value.code == "AI_NOT_AVAILABLE" and e.value.detail["reason"] == "bar_full"
-    assert "top-up" in str(e.value) and "simple Reel" in str(e.value) and "resets" in str(e.value)
+    assert "Ask Alphakore" in str(e.value) and "simple Reel" in str(e.value) and "resets" in str(e.value)
