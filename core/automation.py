@@ -6089,9 +6089,10 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
                 why_bad = e
     if (spec is None and design is not None and design.get("refused")
             and not design.get("stopped")):
-        # Out of credits for the design step: the script and the pictures are
-        # already made and the renderer needs no AI, so film a simple version
-        # rather than nothing (reel_lite). No AI call is made here.
+        # The design step's AI call failed (no credits, a provider error, no
+        # connection) or was left out: the script and the pictures are already
+        # made and the renderer needs no AI, so film a simple version rather
+        # than nothing (reel_lite). No AI call is made here.
         try:
             from . import reel_lite as _lite
             shown = [a for a in (attachments or []) if isinstance(a, dict)
@@ -6104,9 +6105,13 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
             spec = None
             ui.warn(f"   couldn't make the simpler version ({e})")
         if spec is not None:
-            ui.warn("   Not enough AI credits for the full design step, so "
-                    "Prism made a simpler version from your script and "
-                    "pictures. It cost nothing extra.")
+            # The real reason, in the server's own words: a provider error
+            # was once shown as "not enough credits" (27 Nov 2026).
+            err = str(design.get("error") or "").strip()
+            ui.warn("   The full design step did not run"
+                    + (f": {err.rstrip('.')}." if err else ".")
+                    + " Prism made a simpler version from your script and "
+                      "pictures. It cost nothing extra.")
     if spec is None:
         # Keep what actually came back. Without this the one piece of evidence
         # that could explain the failure is discarded at the moment it becomes
@@ -7666,8 +7671,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 ui.err(note)
                 emit("stage_error", {"stage": stage, "error": note, "url": ""})
                 return
-            made = [{"path": p, "kind": "image", "name": os.path.basename(p)}
-                    for p in paths]
+            # `_generated` like every harvested picture: the renderer names the
+            # pictures again from these marks, and without it its names differ
+            # from the ones the design step was given.
+            made = [{"path": p, "kind": "image", "name": os.path.basename(p),
+                     "_generated": True} for p in paths]
             audio_in_pipeline = [
                 f for f in pipeline_files
                 if f.get("kind") == "audio" or str(f.get("path", "")).lower()

@@ -193,6 +193,33 @@ def attach_dir(path: str) -> list[dict]:
     return out
 
 
+IMAGE_EXTS = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+              "image/gif": ".gif"}
+
+
+def image_mime(data: bytes) -> str:
+    """The picture type the bytes really are ("" when not one of these). An
+    AI provider refuses a picture whose declared type does not match, and an
+    image model can answer a request for a .png with JPEG bytes."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return ""
+
+
+def _head(path: str) -> bytes:
+    try:
+        with open(path, "rb") as f:
+            return f.read(16)
+    except OSError:
+        return b""
+
+
 def attach(path: str) -> dict:
     """Build an attachment record for any file. Raises if it doesn't exist."""
     path = os.path.abspath(os.path.expanduser(path))
@@ -212,7 +239,8 @@ def attach(path: str) -> dict:
         "path": path,
         "name": os.path.basename(path),
         "size": os.path.getsize(path),
-        "mime": mimetypes.guess_type(path)[0] or "application/octet-stream",
+        "mime": ((image_mime(_head(path)) if kind == "image" else "")
+                 or mimetypes.guess_type(path)[0] or "application/octet-stream"),
         "kind": kind,
         "text": text,
         "truncated": truncated,

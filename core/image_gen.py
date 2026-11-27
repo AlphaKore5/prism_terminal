@@ -24,6 +24,7 @@ import os
 import time
 
 from . import ai_client as _ai
+from . import files as _files
 from . import openrouter as _openrouter
 
 # OpenRouter's own id for the model (confirmed live against
@@ -153,6 +154,11 @@ def _own_logo(attachments) -> str:
     return ""
 
 
+def _ext(data: bytes) -> str:
+    """The file ending for the picture the model actually sent (often JPEG)."""
+    return _files.IMAGE_EXTS.get(_files.image_mime(data), ".png")
+
+
 def _composite_logo(image_path: str, logo_path: str) -> str:
     """Paste the client's REAL logo onto the generated picture — never ask
     FLUX to draw one. core.assets' own docstring says why: "A model asked
@@ -170,8 +176,11 @@ def _composite_logo(image_path: str, logo_path: str) -> str:
         pos = (base.width - logo.width - margin,
               base.height - logo.height - margin)
         base.alpha_composite(logo, dest=pos)
-        base.convert("RGB").save(image_path, "PNG")
-    return image_path
+        out = os.path.splitext(image_path)[0] + ".png"
+        base.convert("RGB").save(out, "PNG")
+    if out != image_path:
+        os.remove(image_path)
+    return out
 
 
 def _single_brief_prompt(query: str, context: str, skill_text: str = "") -> str:
@@ -382,7 +391,7 @@ def generate(query: str, prior_text, cfg: dict, attachments=None, *,
 
     from . import config as _config
     os.makedirs(_config.RUNS_DIR, exist_ok=True)
-    out = os.path.join(_config.RUNS_DIR, f"flux_{int(time.time())}.png")
+    out = os.path.join(_config.RUNS_DIR, f"flux_{int(time.time())}{_ext(data)}")
     with open(out, "wb") as f:
         f.write(data)
     # The actual prompt, not just a filename — a later follow-up's own
@@ -392,7 +401,7 @@ def generate(query: str, prior_text, cfg: dict, attachments=None, *,
     note = f"{_maker()} drew: {prompt[:280]}"
     if logo_path:
         try:
-            _composite_logo(out, logo_path)
+            out = _composite_logo(out, logo_path)
             note += " (your own logo placed on top)"
         except Exception as e:                               # noqa: BLE001
             note += f" (could not place your logo on it: {e})"
@@ -536,7 +545,7 @@ def generate_artwork(query: str, prior_text, cfg: dict, *,
                 why = str(e)
             continue
         raw = os.path.join(_config.RUNS_DIR,
-                           f"flux_{int(time.time())}_{i}.png")
+                           f"flux_{int(time.time())}_{i}{_ext(data)}")
         with open(raw, "wb") as f:
             f.write(data)
         # A scene plate is kept whole; only a cut-out subject has its ground removed.

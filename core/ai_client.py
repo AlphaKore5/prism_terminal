@@ -38,6 +38,8 @@ from typing import Callable, Iterator, Optional
 
 import requests
 
+from . import files
+
 # A value that stands in for "a provider key" so the many `if not api_key`
 # guards in the app still pass. It is never sent anywhere and never saved.
 AI_KEY = "prism-ai"
@@ -327,8 +329,8 @@ def _raise_for(status: int, data) -> None:
             "AI_NOT_AVAILABLE",
             "You have used this week's AI allowance. "
             + (f"It resets {day}. " if day else "It resets when your week ends. ")
-            + "You can ask Alphakore for a top-up, or make a simple Reel, "
-              "which uses no AI. Nothing was charged.",
+            + "Ask Alphakore if you need more before then, or make a simple "
+              "Reel, which uses no AI. Nothing was charged.",
             err["detail"], status)
     if isinstance(err, dict) and err.get("code"):
         raise AiError(str(err["code"]), str(err.get("message") or ""),
@@ -381,7 +383,13 @@ def _content(prompt: str, attachments: list[dict] | None):
         return prompt
     blocks: list[dict] = [{"type": "text", "text": prompt}]
     for att in attachments:
-        uri = f"data:{att['mime']};base64,{att['b64']}"
+        mime = att["mime"]
+        if att["kind"] != "pdf":            # declare what the bytes are, not what the name says
+            try:
+                mime = files.image_mime(base64.b64decode(att["b64"][:24])) or mime
+            except ValueError:
+                pass
+        uri = f"data:{mime};base64,{att['b64']}"
         if att["kind"] == "pdf":
             blocks.append({"type": "file", "file": {
                 "filename": att.get("name", "drawing.pdf"), "file_data": uri}})

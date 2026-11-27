@@ -1,6 +1,7 @@
 """A plain reel built from the script and the pictures alone, with no AI call.
 
-Used when the art-direction step was refused (out of credits): the script is
+Used when the art-direction step failed or was left out (no credits, a
+provider error, the person chose the simpler version): the script is
 already written and the pictures are already drawn, and the renderer needs no
 AI, so the client still gets a film. It is deliberately simple: one picture,
 a dark band, a kicker, a headline, a support line. No art direction.
