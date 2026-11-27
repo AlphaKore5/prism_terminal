@@ -2664,8 +2664,30 @@ def followup_imagery_instructions(what: str, spec: dict) -> str:
     )
 
 
+_FILMED_CODE_CAP = 80_000
+
+
+def _filmed_code(spec: dict) -> str:
+    """The shared stylesheet and every scene's css and html, for a designer
+    that cannot look back at them. Whole scenes only, up to the cap."""
+    shared = str((spec.get("design") or {}).get("css") or "")
+    parts = ["THE CODE AS FILMED. You have not seen it before: change this code, "
+             "do not design the reel again.",
+             f"SHARED STYLESHEET (design_css):\n```css\n{shared}\n```"]
+    used = len(shared)
+    for i, sc in enumerate(spec.get("scenes") or [], 1):
+        code = (f"SCENE {i} css:\n```css\n{sc.get('css', '')}\n```\n"
+                f"SCENE {i} html:\n```html\n{sc.get('html', '')}\n```")
+        used += len(code)
+        if used > _FILMED_CODE_CAP:
+            parts.append(f"(Scenes {i} onward are too long to show here.)")
+            break
+        parts.append(code)
+    return "\n\n".join(parts) + "\n\n"
+
+
 def followup_instructions(change: str, spec: dict, new_assets: str = "",
-                          context: str = "") -> str:
+                          context: str = "", with_code: bool = False) -> str:
     """What the design conversation is asked when the owner wants a change.
 
     `context` is what an earlier step of the same follow-up produced — a
@@ -2698,6 +2720,7 @@ def followup_instructions(change: str, spec: dict, new_assets: str = "",
             f"or background-image: url(asset:<name>) with proper positioning and animation. Return the updated scenes in your JSON.\n\n")
            if new_assets.strip() else "")
         + (f"Artwork already in the reel: {have}.\n\n" if have else "")
+        + (_filmed_code(spec) if with_code else "")
         + "REPLY WITH ONLY THIS JSON OBJECT, in a ```json fenced block:\n"
         "{\n"
         '  "scenes": [\n'
@@ -2844,7 +2867,8 @@ def apply_followup(spec: dict, patch: dict) -> dict:
 
 
 def refine_spec(spec: dict, change: str, ask, check=None, log=None,
-                new_assets: str = "", context: str = "") -> tuple[dict, list[str]]:
+                new_assets: str = "", context: str = "",
+                with_code: bool = False) -> tuple[dict, list[str]]:
     """Run the change through the design conversation and return (new spec,
     notes). `ask(prompt, expect) -> str` sends a turn in that tab; `check`
     is the same layout check build_spec uses. Raises ReelError when the
@@ -2856,7 +2880,7 @@ def refine_spec(spec: dict, change: str, ask, check=None, log=None,
     total = len(spec.get("scenes") or [])
     if not total:
         raise ReelError("There is no reel to change.")
-    first = followup_instructions(change, spec, new_assets, context)
+    first = followup_instructions(change, spec, new_assets, context, with_code)
     aim_turn(ask, "followup")
     raw = ask(first, SCENE_EXPECT) or ""
     patch = parse_followup(raw, total)

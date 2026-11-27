@@ -5960,7 +5960,10 @@ def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
     new_spec, notes = _web.refine_spec(
         spec, change, ask, check=_web.inspect,
         log=lambda m: ui.info(f"   {m}"), new_assets=listing,
-        context=context)
+        context=context,
+        # A server conversation starts empty: there is no design chat that
+        # remembers the scenes, so the code goes with the change.
+        with_code=_SS.is_session(driver))
     try:
         url = driver.current_url or design_url
     except Exception:                                    # noqa: BLE001
